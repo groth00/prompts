@@ -86,20 +86,51 @@ impl Prompt for MaleCharacterPrompt<'_> {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Character<'a> {
-    pub prompt: &'a str,
-    pub uc: &'a str,
-    pub center: Point,
+    prompt: &'a str,
+    uc: &'a str,
+    center: Point,
     enabled: bool,
 }
 
-impl<'a> Default for Character<'a> {
-    fn default() -> Self {
+impl<'a> Character<'a> {
+    pub fn new() -> Self {
         Self {
             prompt: "",
             uc: "",
             center: Point::default(),
             enabled: true,
         }
+    }
+
+    pub fn prompt(&mut self, s: &'a str) -> &mut Self {
+        self.prompt = s;
+        self
+    }
+
+    pub fn uc(&mut self, s: &'a str) -> &mut Self {
+        self.uc = s;
+        self
+    }
+
+    pub fn center(&mut self, pos: Position) -> &mut Self {
+        self.center = pos.as_point();
+        self
+    }
+
+    pub fn finish(&self) -> Self {
+        *self
+    }
+
+    pub const fn get_prompt(&self) -> &'a str {
+        self.prompt
+    }
+
+    pub const fn get_uc(&self) -> &'a str {
+        self.uc
+    }
+
+    pub const fn get_center(&self) -> Point {
+        self.center
     }
 }
 

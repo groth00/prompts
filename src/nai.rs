@@ -187,15 +187,15 @@ impl<'a> ImageGenRequest<'a> {
         self.parameters.v4_negative_prompt.caption.base_caption = prompt;
     }
 
-    fn add_character(&mut self, prompt: &Character<'a>) {
-        self.parameters.character_prompts.push(*prompt);
+    fn add_character(&mut self, ch: &Character<'a>) {
+        self.parameters.character_prompts.push(*ch);
         self.parameters
             .v4_prompt
             .caption
             .char_captions
             .push(CharCaption {
-                char_caption: prompt.prompt,
-                centers: vec![prompt.center],
+                char_caption: ch.get_prompt(),
+                centers: vec![ch.get_center()],
             });
         self.parameters
             .v4_negative_prompt
@@ -203,7 +203,7 @@ impl<'a> ImageGenRequest<'a> {
             .char_captions
             .push(CharCaption {
                 char_caption: "",
-                centers: vec![prompt.center],
+                centers: vec![ch.get_center()],
             })
     }
 }

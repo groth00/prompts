@@ -1,8 +1,10 @@
 /target
 /novelai-api
+/text
 /output
 
 .env
+.DS_Store
 
 *.db
 *.json

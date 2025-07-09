@@ -1,0 +1,1 @@
+INSERT OR IGNORE INTO artists(name) VALUES(?1);

@@ -1,0 +1,1 @@
+INSERT OR IGNORE INTO series(name) VALUES(?1) RETURNING id;

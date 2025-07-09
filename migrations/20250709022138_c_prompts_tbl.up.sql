@@ -19,6 +19,35 @@ CREATE TABLE IF NOT EXISTS prompts(
   FOREIGN KEY(ch_prompt6) REFERENCES characters(id)
 );
 
+CREATE TABLE IF NOT EXISTS series(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS characters(
+  id INTEGER PRIMARY KEY,
+  series_id INTEGER,
+  name TEXT NOT NULL,
+  FOREIGN KEY(series_id) REFERENCES series(id)
+);
+
+CREATE TABLE IF NOT EXISTS tags(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS artists(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  rating INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS artist_combos(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  rating INTEGER DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS base_prompts(
   id INTEGER PRIMARY KEY,
   start TEXT,
@@ -30,7 +59,7 @@ CREATE TABLE IF NOT EXISTS base_prompts(
   nsfw INTEGER DEFAULT 1
 );
 
-CREATE TABLE IF NOT EXISTS characters(
+CREATE TABLE IF NOT EXISTS character_prompts(
   id INTEGER PRIMARY KEY,
   ch TEXT,
   outfit TEXT,
