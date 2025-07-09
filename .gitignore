@@ -1,0 +1,11 @@
+/target
+/novelai-api
+/output
+
+.env
+
+*.db
+*.json
+*.png
+*.txt
+*.zip
