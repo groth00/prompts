@@ -1,1 +1,1 @@
-INSERT OR IGNORE INTO tags(name) VALUES(?1);
+INSERT OR IGNORE INTO tags(name, category) VALUES(?1, ?2);

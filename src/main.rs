@@ -1,23 +1,24 @@
-#![allow(dead_code)]
-use std::error::Error;
+use std::{error::Error, fs};
 
 use clap::{Parser, Subcommand};
-
-mod db;
+use iced::window::{get_latest, maximize};
 
 mod image_metadata;
 use image_metadata::extract_image_metadata;
 
+mod db;
+mod files;
 mod import;
-
 mod nai;
-use nai::ImageShape;
-
 mod prompt;
-use prompt::{Character, Position};
-use rusqlite::Connection;
+mod ui;
 
-use crate::import::insert_characters_series;
+use import::import;
+use nai::ImageShape;
+use prompt::Character;
+use ui::{State, subscribe, update, view};
+
+use crate::nai::{ImageGenRequest, Requester};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -25,21 +26,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let args = Args::parse();
     match &args.command {
-        Commands::Gen { action: _ } => {
-            let base_prompt = "library";
-            let char1 = Character::new()
-                .prompt("1girl, standing, looking at book")
-                .center(Position::R2C2)
-                .finish();
-            let negative_prompt = "lowres";
+        Commands::Ui => iced::application("Pane Example", update, view)
+            .subscription(subscribe)
+            .run_with(|| {
+                (
+                    State::default(),
+                    get_latest().and_then(|id| maximize(id, true)),
+                )
+            })?,
+        Commands::Gen => {
+            let s = fs::read_to_string("prompt.txt")?;
 
-            nai::generate_image(
-                ImageShape::Portrait,
-                base_prompt,
-                &[char1],
-                Some(negative_prompt),
-            )
-            .await?;
+            let mut req = ImageGenRequest::default();
+            let mut base_prompt = "";
+            let mut chars = vec![];
+
+            for (i, s) in s.lines().enumerate() {
+                if i == 0 {
+                    base_prompt = s;
+                } else {
+                    chars.push(Character::new().prompt(s.into()).finish());
+                }
+            }
+            req.prompt(base_prompt.to_owned());
+
+            for ch in chars {
+                req.add_character(&ch);
+            }
+
+            let requester = Requester::default();
+            if let Err(e) = requester.generate_image(ImageShape::Portrait, req).await {
+                eprintln!("{:?}", e);
+            }
         }
         Commands::Metadata { path } => {
             let map = extract_image_metadata(path)?;
@@ -47,24 +65,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("{}", pretty);
         }
         Commands::Import { action } => match action {
-            ImportCmd::Danbooru => {
-                let mut conn = Connection::open(std::env::var("SQLITE_URL").expect("SQLITE_URL"))?;
-
-                let input = [
-                    (
-                        "text/artist_combos.txt",
-                        include_str!("../sql/i_artist_combos.sql"),
-                    ),
-                    ("text/artists.txt", include_str!("../sql/i_artists.sql")),
-                    ("text/tags.txt", include_str!("../sql/i_tags.sql")),
-                ];
-
-                for i in input {
-                    let rows = import::insert_lines(&mut conn, i.0, i.1)?;
-                    println!("added: {} tags", rows);
-                }
-                insert_characters_series(&mut conn, "text/characters.txt")?;
-            }
+            ImportCmd::Danbooru => import()?,
         },
     }
 
@@ -79,10 +80,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    Gen {
-        #[command(subcommand)]
-        action: GenerateCmd,
-    },
+    Ui,
+    Gen,
     Metadata {
         path: String,
     },
@@ -90,12 +89,6 @@ enum Commands {
         #[command(subcommand)]
         action: ImportCmd,
     },
-}
-
-#[derive(Subcommand)]
-enum GenerateCmd {
-    Foo,
-    Bar,
 }
 
 #[derive(Subcommand)]

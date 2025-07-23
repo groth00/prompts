@@ -1,5 +1,5 @@
 use std::{
-    error::Error,
+    fmt::{self, Display},
     fs::{self},
     io::Cursor,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -17,44 +17,6 @@ const NOVELAI_ENDPOINT: &str = "https://image.novelai.net/ai/generate-image";
 use crate::prompt::{CharCaption, Character, NEGATIVE_PROMPT, V4NegativePrompt, V4Prompt};
 
 // TODO: if custom character position, set use_coords to enable
-
-pub async fn generate_image<'a>(
-    shape: ImageShape,
-    base_prompt: &'a str,
-    char_prompts: &'a [Character<'a>],
-    negative_prompt: Option<&'a str>,
-) -> Result<(), Box<dyn Error>> {
-    let mut req = ImageGenRequest::default();
-
-    req.prompt(base_prompt);
-    req.height_width(shape);
-
-    req.parameters.seed = rand::random_range(1e9..9e9) as u64;
-
-    if let Some(p) = negative_prompt {
-        req.negative_prompt(p);
-    }
-
-    for c in char_prompts {
-        req.add_character(c);
-    }
-
-    let ser = serde_json::to_string_pretty(&req).expect("to_string_pretty");
-    println!("{}", ser);
-
-    let r = Requester::default();
-    let (bytes, end) = r.call_service(&req).await?;
-    println!("{} elapsed", end);
-
-    let res = spawn_blocking(move || -> ZipResult<()> {
-        save_image(bytes)?;
-        Ok(())
-    })
-    .await?;
-    println!("{:?}", res);
-
-    Ok(())
-}
 
 #[derive(Debug)]
 pub struct Requester {
@@ -75,11 +37,61 @@ impl Default for Requester {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum ImageGenerationError {
+    FailedAfterMaxAttempts,
+    SendRequest(String),
+    ClientError(String),
+    Deserialization(String),
+    ZipError(String),
+    JoinError,
+}
+
+impl Display for ImageGenerationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use ImageGenerationError::*;
+        match self {
+            FailedAfterMaxAttempts => write!(f, "failed to generate after max attempts"),
+            JoinError => write!(
+                f,
+                "something went wrong with the background task to save the image"
+            ),
+            SendRequest(err) => write!(f, "{}", err),
+            ClientError(err) => write!(f, "{}", err),
+            Deserialization(err) => write!(f, "read response bytes: {}", err),
+            ZipError(err) => write!(f, "zip: {}", err),
+        }
+    }
+}
+
 impl Requester {
+    pub async fn generate_image<'a>(
+        &self,
+        shape: ImageShape,
+        mut req: ImageGenRequest<'a>,
+    ) -> Result<String, ImageGenerationError> {
+        req.height_width(shape);
+        req.parameters.seed = rand::random_range(1e9..9e9) as u64;
+
+        let (bytes, end) = self.call_service(&req).await?;
+        println!("{} elapsed", end);
+
+        let res = spawn_blocking(move || -> Result<String, ImageGenerationError> {
+            let output_path =
+                save_image(bytes).map_err(|e| ImageGenerationError::ZipError(e.to_string()))?;
+            Ok(output_path)
+        })
+        .await
+        .map_err(|_e| ImageGenerationError::JoinError)??;
+        println!("{:?}", res);
+
+        Ok(res)
+    }
+
     pub async fn call_service<'a>(
         &self,
         params: &ImageGenRequest<'a>,
-    ) -> Result<(Bytes, f64), Box<dyn Error>> {
+    ) -> Result<(Bytes, f64), ImageGenerationError> {
         let mut headers = HeaderMap::new();
         headers.insert("Content-Type", "application/json".parse().unwrap());
 
@@ -94,12 +106,17 @@ impl Requester {
             .headers(headers)
             .bearer_auth(&self.api_token)
             .json::<ImageGenRequest>(params)
-            .build()?;
+            .build()
+            .expect("failed to build request");
 
         let mut attempts = 0;
         let mut wait = 3;
         let resp = loop {
-            let resp = self.client.execute(req.try_clone().unwrap()).await?;
+            let resp = self
+                .client
+                .execute(req.try_clone().unwrap())
+                .await
+                .map_err(|e| ImageGenerationError::SendRequest(e.to_string()))?;
             println!("{}", resp.status());
 
             if resp.status().is_success() {
@@ -108,7 +125,7 @@ impl Requester {
                 || resp.status().is_server_error()
             {
                 if attempts == 0 {
-                    panic!("max attempts exceeded");
+                    return Err(ImageGenerationError::FailedAfterMaxAttempts);
                 }
                 tokio::time::sleep(Duration::from_secs(wait)).await;
                 wait += 1;
@@ -121,16 +138,24 @@ impl Requester {
                 );
                 continue;
             } else if resp.status().is_client_error() {
-                panic!("{}: {:?}", resp.status(), resp.text().await);
+                return Err(ImageGenerationError::ClientError(format!(
+                    "{}: {:?}",
+                    resp.status(),
+                    resp.text().await
+                )));
             }
         };
 
-        let bytes = resp.bytes().await?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ImageGenerationError::Deserialization(e.to_string()))?;
+
         Ok((bytes, start.elapsed().as_secs_f64()))
     }
 }
 
-pub fn save_image(bytes: Bytes) -> ZipResult<()> {
+pub fn save_image(bytes: Bytes) -> ZipResult<String> {
     let reader = Cursor::new(bytes);
     let mut archive = ZipArchive::new(reader)?;
     let mut file = archive.by_index(0)?;
@@ -143,58 +168,51 @@ pub fn save_image(bytes: Bytes) -> ZipResult<()> {
         .unwrap()
         .as_secs();
     let output_path = format!("output/{}.png", now);
-    fs::write(output_path, &buf)?;
+    fs::write(&output_path, &buf)?;
 
-    Ok(())
+    Ok(output_path)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(bound(deserialize = "'de: 'a"))]
 pub struct ImageGenRequest<'a> {
     action: Action,
     /// base prompt; max length 40_000
-    input: &'a str,
+    input: String,
     model: Model,
     parameters: RequestParameters<'a>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    url: Option<String>,
 }
 
 impl<'a> Default for ImageGenRequest<'a> {
     fn default() -> Self {
         Self {
             action: Action::default(),
-            input: "",
+            input: String::new(),
             model: Model::default(),
             parameters: RequestParameters::default(),
-            url: None,
         }
     }
 }
 
 impl<'a> ImageGenRequest<'a> {
-    fn height_width(&mut self, shape: ImageShape) {
+    pub fn height_width(&mut self, shape: ImageShape) {
         self.parameters.width = shape.as_width_height().0;
         self.parameters.height = shape.as_width_height().1;
     }
 
-    fn prompt(&mut self, prompt: &'a str) {
-        self.input = prompt;
+    pub fn prompt(&mut self, prompt: String) {
+        self.input = prompt.clone();
         self.parameters.v4_prompt.caption.base_caption = prompt;
     }
 
-    fn negative_prompt(&mut self, prompt: &'a str) {
-        self.parameters.negative_prompt = prompt;
-        self.parameters.v4_negative_prompt.caption.base_caption = prompt;
-    }
-
-    fn add_character(&mut self, ch: &Character<'a>) {
-        self.parameters.character_prompts.push(*ch);
+    pub fn add_character(&mut self, ch: &Character) {
+        self.parameters.character_prompts.push(ch.clone());
         self.parameters
             .v4_prompt
             .caption
             .char_captions
             .push(CharCaption {
-                char_caption: ch.get_prompt(),
+                char_caption: ch.get_prompt().to_string(),
                 centers: vec![ch.get_center()],
             });
         self.parameters
@@ -202,7 +220,7 @@ impl<'a> ImageGenRequest<'a> {
             .caption
             .char_captions
             .push(CharCaption {
-                char_caption: "",
+                char_caption: String::from(""),
                 centers: vec![ch.get_center()],
             })
     }
@@ -217,7 +235,7 @@ struct RequestParameters<'a> {
     auto_smea: bool,
     cfg_rescale: f32,
     #[serde(rename = "characterPrompts")]
-    character_prompts: Vec<Character<'a>>,
+    character_prompts: Vec<Character>,
     #[serde(skip_serializing_if = "Option::is_none")]
     color_correct: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -280,8 +298,8 @@ struct RequestParameters<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     strength: Option<f32>,
     use_coords: bool,
-    v4_negative_prompt: V4NegativePrompt<'a>,
-    v4_prompt: V4Prompt<'a>,
+    v4_negative_prompt: V4NegativePrompt,
+    v4_prompt: V4Prompt,
     width: u32,
 }
 
@@ -341,6 +359,7 @@ impl Default for RequestParameters<'_> {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default, Clone, Copy)]
 pub enum ImageShape {
     #[default]
@@ -438,7 +457,7 @@ mod test {
     fn serialize() {
         let mut req = ImageGenRequest::default();
 
-        let base_prompt = "nsfw, year 2025, official art, minami (minami373916), asou (asabu202), sky-freedom, pumpkinspicelatte, sp (8454), fellatrix, wakura (gcdan), hth5k, soraoraora, from above, dungeon, empty room, 3::cum in pussy, excessive cum, cum overflow, dripping::, cum pool, 1.16::highly finished, digital illustration, smooth shading, smooth::, 1.1::masterpiece, best quality, incredibly absurdres::, uncensored, -2::multiple views, patreon logo, signature, watermark::, very aesthetic, masterpiece, no text";
+        let base_prompt = "nsfw, year 2025, official art, minami (minami373916), asou (asabu202), sky-freedom, pumpkinspicelatte, sp (8454), fellatrix, wakura (gcdan), hth5k, soraoraora, from above, dungeon, empty room, 3::cum in pussy, excessive cum, cum overflow, dripping::, cum pool, 1.16::highly finished, digital illustration, smooth shading, smooth::, 1.1::masterpiece, best quality, incredibly absurdres::, uncensored, -2::multiple views, patreon logo, signature, watermark::, very aesthetic, masterpiece, no text".into();
 
         req.prompt(base_prompt);
         req.height_width(ImageShape::Portrait);
@@ -449,7 +468,7 @@ mod test {
             req.parameters.v4_negative_prompt,
             V4NegativePrompt {
                 caption: Caption {
-                    base_caption: NEGATIVE_PROMPT,
+                    base_caption: String::from(NEGATIVE_PROMPT),
                     char_captions: vec![],
                 },
                 legacy_uc: false,

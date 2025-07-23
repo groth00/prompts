@@ -5,10 +5,6 @@ const QUALITY_TAGS: &'static str = "1.16::highly finished, digital illustration,
 const NEGATIVE_TAGS: &'static str = "-2::multiple views, patreon logo, signature watermark::";
 pub const NEGATIVE_PROMPT: &str = "lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page, blurry, lowres, error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, logo, too many watermarks, {{{bad eyes}}}, blurry eyes, fewer, extra, missing, worst quality, watermark, unfinished, displeasing, signature, extra digits, artistic error, username, scan, bad anatomy, @_@, mismatched pupils, heart-shaped pupils, glowing eyes, low quality, {{{bad}}}, normal quality, disfigured, flower, artist signature, watermark, monochrome, black bars, cinematic bars, plaque, wall ornament, speech bubble, extra arms, extra breasts, loli, child, amputee, missing limb, 1.22::extra fingers, long fingers, missing fingers, bad hands::, extra digit, fewer digits, mutation, white border, eyes without pupils, multiple views, 1.3::disembodied penis::, x-ray, fake animal ears, animal ears, 1.1::pubic hair, female pubic hair, male pubic hair::, censored, border, 1.2::sound effects, text::";
 
-trait Prompt {
-    fn build(&self) -> String;
-}
-
 pub struct BasePrompt<'a> {
     pub start: &'a str,
     pub artists: &'a str,
@@ -33,9 +29,9 @@ impl Default for BasePrompt<'_> {
     }
 }
 
-impl Prompt for BasePrompt<'_> {
+impl BasePrompt<'_> {
     fn build(&self) -> String {
-        let rating = if self.nsfw { "nsfw" } else { "sfw" };
+        let rating = if self.nsfw { "nsfw" } else { "rating:general" };
         [
             rating,
             self.start,
@@ -56,59 +52,24 @@ impl Prompt for BasePrompt<'_> {
     }
 }
 
-pub struct FemaleCharacterPrompt<'a> {
-    pub ch: &'a str,
-    pub outfit: &'a str,
-    pub posture: &'a str,
-    pub actions: &'a str,
-    pub body: &'a str,
-    pub other: &'a str,
-}
-
-impl Prompt for FemaleCharacterPrompt<'_> {
-    fn build(&self) -> String {
-        String::new()
-    }
-}
-
-pub struct MaleCharacterPrompt<'a> {
-    pub ch: &'a str,
-    pub actions: &'a str,
-    pub pp: &'a str,
-    pub other: &'a str,
-}
-
-impl Prompt for MaleCharacterPrompt<'_> {
-    fn build(&self) -> String {
-        String::new()
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct Character<'a> {
-    prompt: &'a str,
-    uc: &'a str,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Character {
+    prompt: String,
     center: Point,
     enabled: bool,
 }
 
-impl<'a> Character<'a> {
+impl Character {
     pub fn new() -> Self {
         Self {
-            prompt: "",
-            uc: "",
+            prompt: String::new(),
             center: Point::default(),
             enabled: true,
         }
     }
 
-    pub fn prompt(&mut self, s: &'a str) -> &mut Self {
+    pub fn prompt(&mut self, s: String) -> &mut Self {
         self.prompt = s;
-        self
-    }
-
-    pub fn uc(&mut self, s: &'a str) -> &mut Self {
-        self.uc = s;
         self
     }
 
@@ -118,15 +79,11 @@ impl<'a> Character<'a> {
     }
 
     pub fn finish(&self) -> Self {
-        *self
+        self.clone()
     }
 
-    pub const fn get_prompt(&self) -> &'a str {
-        self.prompt
-    }
-
-    pub const fn get_uc(&self) -> &'a str {
-        self.uc
+    pub fn get_prompt(&self) -> &str {
+        &self.prompt
     }
 
     pub const fn get_center(&self) -> Point {
@@ -135,14 +92,13 @@ impl<'a> Character<'a> {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(bound(deserialize = "'de: 'a"))]
-pub struct V4Prompt<'a> {
-    pub caption: Caption<'a>,
+pub struct V4Prompt {
+    pub caption: Caption,
     pub use_coords: bool,
     pub use_order: bool,
 }
 
-impl<'a> Default for V4Prompt<'a> {
+impl Default for V4Prompt {
     fn default() -> Self {
         Self {
             caption: Caption::default(),
@@ -153,17 +109,16 @@ impl<'a> Default for V4Prompt<'a> {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
-#[serde(bound(deserialize = "'de: 'a"))]
-pub struct V4NegativePrompt<'a> {
-    pub caption: Caption<'a>,
+pub struct V4NegativePrompt {
+    pub caption: Caption,
     pub legacy_uc: bool,
 }
 
-impl<'a> Default for V4NegativePrompt<'a> {
+impl Default for V4NegativePrompt {
     fn default() -> Self {
         Self {
             caption: Caption {
-                base_caption: NEGATIVE_PROMPT,
+                base_caption: String::from(NEGATIVE_PROMPT),
                 char_captions: vec![],
             },
             legacy_uc: false,
@@ -172,14 +127,14 @@ impl<'a> Default for V4NegativePrompt<'a> {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct Caption<'a> {
-    pub base_caption: &'a str,
-    pub char_captions: Vec<CharCaption<'a>>,
+pub struct Caption {
+    pub base_caption: String,
+    pub char_captions: Vec<CharCaption>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct CharCaption<'a> {
-    pub char_caption: &'a str,
+pub struct CharCaption {
+    pub char_caption: String,
     pub centers: Vec<Point>,
 }
 
@@ -195,6 +150,7 @@ impl Default for Point {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum Position {
     R0C0,

@@ -1,9 +1,24 @@
 -- Add down migration script here
-DROP TABLE IF EXISTS prompts;
-DROP TABLE IF EXISTS series;
 DROP TABLE IF EXISTS characters;
+DROP TABLE IF EXISTS series;
+
 DROP TABLE IF EXISTS tags;
 DROP TABLE IF EXISTS artists;
 DROP TABLE IF EXISTS artist_combos;
+
+DROP TABLE IF EXISTS prompt_starts;
+DROP TABLE IF EXISTS locations;
+DROP TABLE IF EXISTS scenes;
+DROP TABLE IF EXISTS quality;
+DROP TABLE IF EXISTS negatives;
+
+DROP TABLE IF EXISTS characters_desc;
+DROP TABLE IF EXISTS outfits;
+DROP TABLE IF EXISTS postures;
+DROP TABLE IF EXISTS actions;
+DROP TABLE IF EXISTS body;
+DROP TABLE IF EXISTS expressions;
+
 DROP TABLE IF EXISTS base_prompts;
 DROP TABLE IF EXISTS character_prompts;
+DROP TABLE IF EXISTS prompts;
