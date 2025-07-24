@@ -1,60 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-const START_TAGS: &'static str = "year 2025, official art";
-const QUALITY_TAGS: &'static str = "1.16::highly finished, digital illustration, smooth shading, smooth::, 1.1::masterpiece, best quality, incredibly absurdres::, uncensored";
-const NEGATIVE_TAGS: &'static str = "-2::multiple views, patreon logo, signature watermark::";
-pub const NEGATIVE_PROMPT: &str = "lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page, blurry, lowres, error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, logo, too many watermarks, {{{bad eyes}}}, blurry eyes, fewer, extra, missing, worst quality, watermark, unfinished, displeasing, signature, extra digits, artistic error, username, scan, bad anatomy, @_@, mismatched pupils, heart-shaped pupils, glowing eyes, low quality, {{{bad}}}, normal quality, disfigured, flower, artist signature, watermark, monochrome, black bars, cinematic bars, plaque, wall ornament, speech bubble, extra arms, extra breasts, loli, child, amputee, missing limb, 1.22::extra fingers, long fingers, missing fingers, bad hands::, extra digit, fewer digits, mutation, white border, eyes without pupils, multiple views, 1.3::disembodied penis::, x-ray, fake animal ears, animal ears, 1.1::pubic hair, female pubic hair, male pubic hair::, censored, border, 1.2::sound effects, text::";
-
-pub struct BasePrompt<'a> {
-    pub start: &'a str,
-    pub artists: &'a str,
-    pub location: &'a str,
-    pub other: &'a str,
-    pub quality: &'a str,
-    pub negative: &'a str,
-    pub nsfw: bool,
-}
-
-impl Default for BasePrompt<'_> {
-    fn default() -> Self {
-        Self {
-            start: START_TAGS,
-            artists: "",
-            location: "",
-            other: "",
-            quality: QUALITY_TAGS,
-            negative: NEGATIVE_TAGS,
-            nsfw: true,
-        }
-    }
-}
-
-impl BasePrompt<'_> {
-    fn build(&self) -> String {
-        let rating = if self.nsfw { "nsfw" } else { "rating:general" };
-        [
-            rating,
-            self.start,
-            self.artists,
-            self.location,
-            self.other,
-            self.quality,
-            self.negative,
-        ]
-        .iter()
-        .fold(String::new(), |mut acc, s| {
-            if !s.is_empty() {
-                acc.push_str(s);
-                acc.push(',');
-            }
-            acc
-        })
-    }
-}
+pub const BASE_PROMPT: &'static str = "year 2025, official art, 1.16::highly finished, digital illustration, smooth shading, smooth::, 1.1::masterpiece, best quality, incredibly absurdres::, uncensored, -2::patreon logo, artist signature, watermark::";
+pub const NEGATIVE_PROMPT: &'static str = "lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page, blurry, lowres, error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, logo, too many watermarks, {{{bad eyes}}}, blurry eyes, fewer, extra, missing, worst quality, watermark, unfinished, displeasing, signature, extra digits, artistic error, username, scan, bad anatomy, @_@, mismatched pupils, heart-shaped pupils, glowing eyes, low quality, {{{bad}}}, normal quality, disfigured, flower, artist signature, watermark, monochrome, black bars, cinematic bars, plaque, wall ornament, speech bubble, extra arms, extra breasts, loli, child, amputee, missing limb, 1.22::extra fingers, long fingers, missing fingers, bad hands::, extra digit, fewer digits, mutation, white border, eyes without pupils, multiple views, 1.3::disembodied penis::, x-ray, fake animal ears, animal ears, 1.1::pubic hair, female pubic hair, male pubic hair::, censored, border, 1.2::sound effects, text::";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Character {
-    prompt: String,
+    pub prompt: String,
     center: Point,
     enabled: bool,
 }
@@ -151,7 +102,7 @@ impl Default for Point {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum Position {
     R0C0,
     R0C1,
@@ -209,25 +160,5 @@ impl Position {
             Self::R4C3 => Point { x: 0.9, y: 0.7 },
             Self::R4C4 => Point { x: 0.9, y: 0.9 },
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn build() {
-        let mut p = BasePrompt::default();
-        let artists = "minami (minami373916), asou (asabu202), sky-freedom, pumpkinspicelatte, sp (8454), fellatrix, wakura (gcdan), hth5k, soraoraora";
-        p.artists = artists;
-
-        let full = p.build();
-        println!("{}", full);
-
-        let mut expected = ["nsfw", START_TAGS, artists, QUALITY_TAGS, NEGATIVE_TAGS].join(",");
-        expected.push(',');
-
-        assert_eq!(full, expected);
     }
 }

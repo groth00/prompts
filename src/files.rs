@@ -4,13 +4,75 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// flags
+/// 0b0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000
+///                                                                                 | expanded
+///                                                                                | visited
+///                                                                               | selected
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub path: PathBuf,
     pub kind: EntryKind,
-    pub expanded: bool,
-    pub visited: bool,
+    pub flags: u64,
     pub children: Option<Vec<Entry>>,
+}
+
+#[allow(dead_code)]
+impl Entry {
+    #[inline(always)]
+    pub const fn expanded(&self) -> bool {
+        self.flags & 1 == 1
+    }
+
+    #[inline(always)]
+    pub fn set_expanded(&mut self) {
+        self.flags |= 1;
+    }
+
+    #[inline(always)]
+    pub fn toggle_expanded(&mut self) {
+        self.flags ^= 1;
+    }
+
+    #[inline(always)]
+    pub fn clear_expanded(&mut self) {
+        self.flags &= 0xFFFF_FFFE;
+    }
+
+    #[inline(always)]
+    pub const fn visited(&self) -> bool {
+        (self.flags >> 1) & 1 == 1
+    }
+
+    #[inline(always)]
+    pub fn set_visited(&mut self) {
+        self.flags |= 2;
+    }
+
+    #[inline(always)]
+    pub fn toggle_visited(&mut self) {
+        self.flags ^= 2;
+    }
+
+    #[inline(always)]
+    pub const fn selected(&self) -> bool {
+        (self.flags >> 2) & 1 == 1
+    }
+
+    #[inline(always)]
+    pub fn toggle_selected(&mut self) {
+        self.flags ^= 4;
+    }
+
+    #[inline(always)]
+    pub fn set_selected(&mut self) {
+        self.flags |= 4;
+    }
+
+    #[inline(always)]
+    pub fn clear_selected(&mut self) {
+        self.flags &= 0xFFFF_FFFB;
+    }
 }
 
 impl PartialEq for Entry {
@@ -88,10 +150,12 @@ impl FilesState {
             Enter => {
                 if let Some(entry) = selected_entry_mut(&mut self.entries, &self.selected) {
                     if entry.kind == EntryKind::Folder {
-                        entry.expanded = !entry.expanded;
-                        if !entry.visited {
-                            entry.children = Some(entries(&entry.path));
-                            entry.visited = true;
+                        entry.toggle_expanded();
+                        if !entry.visited() {
+                            let mut entries = entries(&entry.path);
+                            entries.sort();
+                            entry.children = Some(entries);
+                            entry.set_visited();
                         }
                         update_visible(self);
                     } else {
@@ -105,13 +169,13 @@ impl FilesState {
             }
             RefreshSelected => {
                 if let Some(entry) = selected_entry_mut(&mut self.entries, &self.selected) {
-                    if entry.kind == EntryKind::Folder && entry.visited {
+                    if entry.kind == EntryKind::Folder && entry.visited() {
                         if let Some(children) = entry.children.as_mut() {
                             children.clear();
                         }
                         entry.children = Some(entries(&entry.path));
                     }
-                    if entry.expanded {
+                    if entry.expanded() {
                         update_visible(self);
                     }
                 }
@@ -121,8 +185,8 @@ impl FilesState {
             CloseAll => {
                 let queue = &mut self.entries;
                 while let Some(mut entry) = queue.pop() {
-                    if entry.expanded {
-                        entry.expanded = false
+                    if entry.expanded() {
+                        entry.clear_expanded();
                     }
                     if entry.kind == EntryKind::Folder && entry.children.is_some() {
                         queue.extend_from_slice(&entry.children.unwrap());
@@ -205,24 +269,24 @@ pub fn update_visible(state: &mut FilesState) {
         let path = &state.selected;
 
         if let Some(entry) = selected_entry(&state.entries, path) {
-            if !entry.expanded {
-                let mut j = i + 1;
-                while j < state.visible.len() && state.visible[j].depth > d {
-                    j += 1;
-                }
-                state.visible.drain(i + 1..j);
-            } else {
-                let mut to_insert = Vec::new();
+            let mut j = i + 1;
+            while j < state.visible.len() && state.visible[j].depth > d {
+                j += 1;
+            }
+            state.visible.drain(i + 1..j);
+
+            if entry.expanded() {
+                let mut visible = Vec::new();
                 let mut queue = vec![(path.clone(), d + 1)];
 
                 while let Some((current_path, depth)) = queue.pop() {
                     if let Some(entry) = selected_entry(&state.entries, &current_path) {
-                        if entry.expanded {
+                        if entry.expanded() {
                             if let Some(children) = &entry.children {
                                 for (i, _e) in children.iter().enumerate() {
                                     let mut child_path = current_path.clone();
                                     child_path.push(i);
-                                    to_insert.push(VisibleEntry {
+                                    visible.push(VisibleEntry {
                                         path: child_path.clone(),
                                         depth,
                                     });
@@ -230,7 +294,7 @@ pub fn update_visible(state: &mut FilesState) {
                                         .children
                                         .as_ref()
                                         .and_then(|v| v.get(i))
-                                        .filter(|e| e.expanded)
+                                        .filter(|e| e.expanded())
                                     {
                                         queue.push((child_path.clone(), depth + 1));
                                     }
@@ -239,7 +303,7 @@ pub fn update_visible(state: &mut FilesState) {
                         }
                     }
                 }
-                state.visible.splice(i + 1..i + 1, to_insert);
+                state.visible.splice(i + 1..i + 1, visible);
             }
         }
     }
@@ -261,7 +325,7 @@ pub fn init_visible<'a>(
             path: path.clone(),
         });
 
-        if entry.kind == EntryKind::Folder && entry.expanded && entry.children.is_some() {
+        if entry.kind == EntryKind::Folder && entry.expanded() && entry.children.is_some() {
             init_visible(entry.children.as_ref().unwrap(), out, depth + 1, path);
         }
     }
@@ -269,7 +333,7 @@ pub fn init_visible<'a>(
 
 /// Get unsorted entries of directory
 pub fn entries<P: AsRef<Path>>(dir: P) -> Vec<Entry> {
-    let mut read_dir = fs::read_dir(dir).expect("read_dir .");
+    let mut read_dir = fs::read_dir(dir).expect("read_dir");
     let mut entries = Vec::new();
     while let Some(Ok(entry)) = read_dir.next() {
         if let Ok(meta) = entry.metadata() {
@@ -278,16 +342,14 @@ pub fn entries<P: AsRef<Path>>(dir: P) -> Vec<Entry> {
                 entries.push(Entry {
                     path,
                     kind: EntryKind::File,
-                    visited: false,
-                    expanded: false,
+                    flags: 0,
                     children: None,
                 });
             } else if meta.is_dir() {
                 entries.push(Entry {
                     path,
                     kind: EntryKind::Folder,
-                    visited: false,
-                    expanded: false,
+                    flags: 0,
                     children: Some(Vec::new()),
                 });
             }
@@ -311,10 +373,9 @@ mod test {
         assert_eq!(
             entry,
             Some(Entry {
-                path: PathBuf::from("./src"),
+                path: PathBuf::from("./migrations"),
                 kind: EntryKind::Folder,
-                visited: false,
-                expanded: false,
+                flags: 0,
                 children: Some(Vec::new()),
             })
             .as_mut()
@@ -335,22 +396,20 @@ mod test {
     #[test]
     fn selected_after_enter() {
         let mut state = FilesState::new(".");
-        // ./.git, ./src, ./target
         // visit ./src
-        state.selected = vec![1];
+        state.selected = vec![5];
         state.cmd(Command::Enter);
 
         // visit ./src/main.rs
-        state.selected = vec![1, 0];
+        state.selected = vec![5, 0];
 
         let entry = selected_entry(&state.entries, &state.selected);
         assert_eq!(
             entry,
             Some(Entry {
-                path: PathBuf::from("./src/main.rs"),
+                path: PathBuf::from("./src/db.rs"),
                 kind: EntryKind::File,
-                visited: false,
-                expanded: false,
+                flags: 0,
                 children: None,
             })
             .as_ref()
@@ -360,42 +419,36 @@ mod test {
     #[test]
     fn visible_after_enter() {
         let mut state = FilesState::new(".");
-        // .target/
-        state.selected = vec![2];
+        // ./migrations
+        state.selected = vec![6];
         state.cmd(Command::Enter);
 
         // NOTE: state.visible contains the flattened view, state.entries contains the nodes
-        //
-        // ./target -> [./target/debug, ./target/rust-analyzer, ./target/.rustc_info.json]
         let entry = selected_entry(&state.entries, &state.selected);
-        assert_eq!(10, state.visible.len());
+        assert_eq!(24, state.visible.len());
         assert_eq!(
             entry,
             Some(Entry {
                 path: PathBuf::from("./target"),
                 kind: EntryKind::Folder,
-                visited: true,
-                expanded: true,
+                flags: 1,
                 children: Some(vec![
                     Entry {
                         path: PathBuf::from("./target/debug"),
                         kind: EntryKind::Folder,
-                        visited: false,
-                        expanded: false,
+                        flags: 0,
                         children: Some(vec![]),
                     },
                     Entry {
                         path: PathBuf::from("./target/rust-analyzer"),
                         kind: EntryKind::Folder,
-                        visited: false,
-                        expanded: false,
+                        flags: 0,
                         children: Some(vec![]),
                     },
                     Entry {
                         path: PathBuf::from("./target/.rustc_info.json"),
                         kind: EntryKind::Folder,
-                        visited: false,
-                        expanded: false,
+                        flags: 0,
                         children: None,
                     }
                 ])
@@ -408,7 +461,7 @@ mod test {
     fn refresh_full() {
         let mut state = FilesState::new(".");
 
-        assert_eq!(7, state.entries.len());
+        assert_eq!(21, state.entries.len());
 
         if fs::exists("foo").expect("exists foo") {
             fs::remove_file("foo").expect("remove foo");
@@ -421,12 +474,11 @@ mod test {
 
         state.cmd(Command::Refresh);
 
-        assert_eq!(8, state.entries.len());
+        assert_eq!(22, state.entries.len());
         assert!(state.entries.contains(&Entry {
             path: PathBuf::from("./foo"),
             kind: EntryKind::Folder,
-            visited: false,
-            expanded: false,
+            flags: 0,
             children: None,
         }));
 
@@ -440,8 +492,7 @@ mod test {
         assert!(state.entries.contains(&Entry {
             path: PathBuf::from("./temp"),
             kind: EntryKind::Folder,
-            visited: false,
-            expanded: false,
+            flags: 0,
             children: Some(vec![])
         }));
         let visible_snapshot = state.visible.clone();
@@ -462,13 +513,11 @@ mod test {
         assert!(state.entries.contains(&Entry {
             path: PathBuf::from("./temp"),
             kind: EntryKind::Folder,
-            visited: false,
-            expanded: false,
+            flags: 0,
             children: Some(vec![Entry {
                 path: PathBuf::from("./temp/foo"),
                 kind: EntryKind::File,
-                visited: false,
-                expanded: false,
+                flags: 0,
                 children: None,
             }])
         }));

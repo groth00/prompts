@@ -16,9 +16,6 @@ const NOVELAI_ENDPOINT: &str = "https://image.novelai.net/ai/generate-image";
 
 use crate::prompt::{CharCaption, Character, NEGATIVE_PROMPT, V4NegativePrompt, V4Prompt};
 
-// TODO: if custom character position, set use_coords to enable
-
-#[derive(Debug)]
 pub struct Requester {
     client: Client,
     api_token: String,
@@ -173,7 +170,7 @@ pub fn save_image(bytes: Bytes) -> ZipResult<String> {
     Ok(output_path)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(bound(deserialize = "'de: 'a"))]
 pub struct ImageGenRequest<'a> {
     action: Action,
@@ -224,9 +221,14 @@ impl<'a> ImageGenRequest<'a> {
                 centers: vec![ch.get_center()],
             })
     }
+
+    pub fn use_coords(&mut self, enable: bool) {
+        self.parameters.use_coords = enable;
+        self.parameters.v4_prompt.use_coords = enable;
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(bound(deserialize = "'de: 'a"))]
 struct RequestParameters<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -360,7 +362,7 @@ impl Default for RequestParameters<'_> {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 pub enum ImageShape {
     #[default]
     Portrait,
@@ -388,7 +390,7 @@ impl ImageShape {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Action {
     #[default]
@@ -397,7 +399,7 @@ enum Action {
     Img2Img,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Model {
     #[default]
@@ -418,21 +420,21 @@ enum Model {
     // nai-diffusion-3
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum NoiseSchedule {
     #[default]
     Karras,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Sampler {
     #[default]
     KEulerAncestral,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Stream {
     #[default]
@@ -440,7 +442,7 @@ enum Stream {
     Sse,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct Img2ImgParameters {
     color_correct: bool,
     extra_noise_seed: u8,

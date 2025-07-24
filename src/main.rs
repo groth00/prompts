@@ -1,4 +1,4 @@
-use std::{error::Error, fs};
+use std::fs;
 
 use clap::{Parser, Subcommand};
 use iced::window::{get_latest, maximize};
@@ -14,28 +14,32 @@ mod prompt;
 mod ui;
 
 use import::import;
-use nai::ImageShape;
+use nai::{ImageGenRequest, ImageShape, Requester};
 use prompt::Character;
 use ui::{State, subscribe, update, view};
 
-use crate::nai::{ImageGenRequest, Requester};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> iced::Result {
     dotenvy::dotenv().expect("dotenv");
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let args = Args::parse();
+
     match &args.command {
-        Commands::Ui => iced::application("Pane Example", update, view)
-            .subscription(subscribe)
-            .run_with(|| {
-                (
-                    State::default(),
-                    get_latest().and_then(|id| maximize(id, true)),
-                )
-            })?,
+        Commands::Ui => {
+            iced::application("NovelAI Desktop App", update, view)
+                .subscription(subscribe)
+                .run_with(|| {
+                    (
+                        State::default(),
+                        get_latest().and_then(|id| maximize(id, true)),
+                    )
+                })?;
+        }
         Commands::Gen => {
-            let s = fs::read_to_string("prompt.txt")?;
+            let s = fs::read_to_string("prompt.txt").expect("open prompt.txt");
 
             let mut req = ImageGenRequest::default();
             let mut base_prompt = "";
@@ -54,18 +58,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 req.add_character(&ch);
             }
 
-            let requester = Requester::default();
-            if let Err(e) = requester.generate_image(ImageShape::Portrait, req).await {
-                eprintln!("{:?}", e);
-            }
+            runtime.block_on(async {
+                let requester = Requester::default();
+                if let Err(e) = requester.generate_image(ImageShape::Portrait, req).await {
+                    eprintln!("{:?}", e);
+                }
+            });
         }
         Commands::Metadata { path } => {
-            let map = extract_image_metadata(path)?;
-            let pretty = serde_json::to_string_pretty(&map)?;
-            println!("{}", pretty);
+            if let Ok(map) = extract_image_metadata(path) {
+                if let Ok(ser) = serde_json::to_string_pretty(&map) {
+                    println!("{:?}", ser);
+                }
+            }
         }
         Commands::Import { action } => match action {
-            ImportCmd::Danbooru => import()?,
+            ImportCmd::Danbooru => match import() {
+                Ok(_) => println!("import ok"),
+                Err(e) => eprintln!("import error: {}", e),
+            },
         },
     }
 

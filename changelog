@@ -1,0 +1,17 @@
+2025-07-23 to 2025-07-24
+
+- Added
+drop png file onto window -> import metadata
+key press "i" in files pane -> import metadata
+if custom character position, set use_coords to enable
+delete for files pane (+remove from cache)
+batch mode
+batch move file
+
+- Fixed
+shutdown iced app in tokio runtime
+
+- Changed
+bits instead of bools for state (expanded, visited, etc.)
+
+- Removed
