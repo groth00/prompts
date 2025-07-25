@@ -1,3 +1,22 @@
+- Added
+- Fixed
+- Changed
+- Removed
+
+
+2025-07-24 to 2025-07-25
+- Added
+scuffed prompt history
+batch extract and insert prompts from images in a directory into db (see https://github.com/NovelAI/novelai-image-metadata)
+load and save prompts to sqlite
+- sorted by timestamp
+- combo box
+- store sorted names and hashmap in state
+
+- Fixed
+- Changed
+- Removed
+
 2025-07-23 to 2025-07-24
 
 - Added

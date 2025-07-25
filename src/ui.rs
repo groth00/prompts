@@ -1,9 +1,10 @@
 use std::{
-    collections::HashSet,
     fmt::{self, Display},
     fs,
+    hash::{Hash, Hasher},
     path::PathBuf,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use iced::{
@@ -15,42 +16,30 @@ use iced::{
         key::{Key, Named},
     },
     widget::{
-        Column, Image, PaneGrid, button, center, column, container,
+        Column, Image, PaneGrid, button, center, column, combo_box, container,
         image::Handle,
         pane_grid::{self, Axis, Configuration, Direction},
         pick_list, row, scrollable,
         shader::wgpu::naga::FastHashMap,
         text, text_editor,
+        text_editor::{Action, Edit},
     },
     window,
 };
+use rusqlite::Connection;
 
 use crate::{
+    db::{Template, fetch_prompts},
     files::{
         Entry, EntryKind, FilesState, entries, init_visible, selected_entry, selected_entry_mut,
         update_visible,
     },
     image_metadata::extract_image_metadata,
-    nai::{ImageGenRequest, ImageGenerationError, Requester},
-    prompt::{self, BASE_PROMPT, Point, Position},
+    nai::{self, ImageGenRequest, ImageGenerationError, Point, Position, Requester},
 };
 
 const FILE_EXTENSIONS: [&'static str; 7] = ["avif", "gif", "jpeg", "jpg", "qoi", "png", "webp"];
 const MAX_VISIBLE: usize = 40;
-
-struct CharacterContent {
-    c: prompt::Character,
-    content: text_editor::Content,
-}
-
-impl CharacterContent {
-    fn new() -> Self {
-        Self {
-            c: prompt::Character::new(),
-            content: text_editor::Content::new(),
-        }
-    }
-}
 
 pub struct State {
     message: Option<String>,
@@ -65,6 +54,21 @@ pub struct State {
     c6: CharacterContent,
     curr_char: CharacterNum,
 
+    conn: Connection,
+
+    base_options: combo_box::State<String>,
+    base_map: FastHashMap<String, String>,
+    base_selected: Option<String>,
+
+    char_options: combo_box::State<String>,
+    char_map: FastHashMap<String, String>,
+    char_selected: Option<String>,
+
+    template_options: combo_box::State<String>,
+    template_map: FastHashMap<String, Template>,
+    template_selected: Option<String>,
+
+    history: Vec<PromptHistoryEntry>,
     temp: Vec<(Vec<usize>, PathBuf)>,
     files_mode: FilesMode,
     image_gen_ip: bool,
@@ -75,6 +79,12 @@ pub struct State {
 
 impl Default for State {
     fn default() -> Self {
+        let mut conn =
+            Connection::open(std::env::var("SQLITE_URL").expect("missing SQLITE_URL env var"))
+                .expect("open connection");
+        let (base_options, base_map, char_options, char_map, template_options, template_map) =
+            fetch_prompts(&mut conn).expect("fetch_prompts");
+
         let files_pane = Pane::new(PaneId::Files);
         let prompts_pane = Pane::new(PaneId::Prompts);
         let image_pane = Pane::new(PaneId::Image);
@@ -95,7 +105,7 @@ impl Default for State {
             message: None,
             panes,
             focus: None,
-            base_prompt: text_editor::Content::with_text(BASE_PROMPT),
+            base_prompt: text_editor::Content::new(),
             c1: CharacterContent::new(),
             c2: CharacterContent::new(),
             c3: CharacterContent::new(),
@@ -104,6 +114,20 @@ impl Default for State {
             c6: CharacterContent::new(),
             curr_char: CharacterNum::Char1,
 
+            conn,
+            base_options: combo_box::State::new(base_options),
+            base_map,
+            base_selected: None,
+
+            char_options: combo_box::State::new(char_options),
+            char_map,
+            char_selected: None,
+
+            template_options: combo_box::State::new(template_options),
+            template_map,
+            template_selected: None,
+
+            history: Vec::new(),
             temp: Vec::new(),
             files_mode: FilesMode::Normal,
             image_gen_ip: false,
@@ -150,23 +174,13 @@ pub enum Message {
     MoveBatch,
     FilesMode(FilesMode),
     SelectEntry,
-}
+    BasePromptSelected(String),
+    CharacterPromptSelected(String),
+    TemplateSelected(String),
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub enum FilesMode {
-    #[default]
-    Normal,
-    Batch,
-}
-
-impl Display for FilesMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use FilesMode::*;
-        match self {
-            Normal => write!(f, "Normal"),
-            Batch => write!(f, "Batch"),
-        }
-    }
+    // TODO:
+    SavePrompt(String),
+    RenamePrompt(String),
 }
 
 pub fn update(state: &mut State, msg: Message) -> Task<Message> {
@@ -248,6 +262,15 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 c.c.prompt(c.content.text());
                 req.add_character(&c.c);
             }
+
+            state.history.push(PromptHistoryEntry {
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                prompt: req.get_prompt(),
+                characters: req.get_characters(),
+            });
 
             if [
                 state.c1.c.get_center(),
@@ -483,6 +506,133 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 ));
             }
         }
+        BasePromptSelected(s) => {
+            if let Some(prompt) = state.base_map.get(&s) {
+                state.base_selected = Some(s);
+                state.base_prompt.perform(Action::SelectAll);
+                state.base_prompt.perform(Action::Edit(Edit::Delete));
+                state
+                    .base_prompt
+                    .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
+            }
+        }
+        CharacterPromptSelected(s) => {
+            if let Some(prompt) = state.char_map.get(&s) {
+                state.char_selected = Some(s);
+                match state.curr_char {
+                    CharacterNum::Char1 => {
+                        state.c1.content.perform(Action::SelectAll);
+                        state.c1.content.perform(Action::Edit(Edit::Delete));
+                        state
+                            .c1
+                            .content
+                            .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
+                    }
+                    CharacterNum::Char2 => {
+                        state.c2.content.perform(Action::SelectAll);
+                        state.c2.content.perform(Action::Edit(Edit::Delete));
+                        state
+                            .c2
+                            .content
+                            .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
+                    }
+                    CharacterNum::Char3 => {
+                        state.c3.content.perform(Action::SelectAll);
+                        state.c3.content.perform(Action::Edit(Edit::Delete));
+                        state
+                            .c3
+                            .content
+                            .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
+                    }
+                    CharacterNum::Char4 => {
+                        state.c4.content.perform(Action::SelectAll);
+                        state.c4.content.perform(Action::Edit(Edit::Delete));
+                        state
+                            .c4
+                            .content
+                            .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
+                    }
+                    CharacterNum::Char5 => {
+                        state.c5.content.perform(Action::SelectAll);
+                        state.c5.content.perform(Action::Edit(Edit::Delete));
+                        state
+                            .c5
+                            .content
+                            .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
+                    }
+                    CharacterNum::Char6 => {
+                        state.c6.content.perform(Action::SelectAll);
+                        state.c6.content.perform(Action::Edit(Edit::Delete));
+                        state
+                            .c6
+                            .content
+                            .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
+                    }
+                }
+            }
+        }
+        TemplateSelected(s) => {
+            if let Some(template) = state.template_map.get(&s) {
+                state.template_selected = Some(s);
+
+                state.base_prompt.perform(Action::SelectAll);
+                state.base_prompt.perform(Action::Edit(Edit::Delete));
+                state
+                    .base_prompt
+                    .perform(Action::Edit(Edit::Paste(Arc::new(template.base.clone()))));
+
+                if let Some(c1) = &template.c1 {
+                    state.c1.content.perform(Action::SelectAll);
+                    state.c1.content.perform(Action::Edit(Edit::Delete));
+                    state
+                        .c1
+                        .content
+                        .perform(Action::Edit(Edit::Paste(Arc::new(c1.clone()))));
+                }
+                if let Some(c2) = &template.c2 {
+                    state.c2.content.perform(Action::SelectAll);
+                    state.c2.content.perform(Action::Edit(Edit::Delete));
+                    state
+                        .c2
+                        .content
+                        .perform(Action::Edit(Edit::Paste(Arc::new(c2.clone()))));
+                }
+                if let Some(c3) = &template.c3 {
+                    state.c3.content.perform(Action::SelectAll);
+                    state.c3.content.perform(Action::Edit(Edit::Delete));
+                    state
+                        .c3
+                        .content
+                        .perform(Action::Edit(Edit::Paste(Arc::new(c3.clone()))));
+                }
+                if let Some(c4) = &template.c4 {
+                    state.c4.content.perform(Action::SelectAll);
+                    state.c4.content.perform(Action::Edit(Edit::Delete));
+                    state
+                        .c4
+                        .content
+                        .perform(Action::Edit(Edit::Paste(Arc::new(c4.clone()))));
+                }
+                if let Some(c5) = &template.c5 {
+                    state.c5.content.perform(Action::SelectAll);
+                    state.c5.content.perform(Action::Edit(Edit::Delete));
+                    state
+                        .c5
+                        .content
+                        .perform(Action::Edit(Edit::Paste(Arc::new(c5.clone()))));
+                }
+                if let Some(c6) = &template.c6 {
+                    state.c6.content.perform(Action::SelectAll);
+                    state.c6.content.perform(Action::Edit(Edit::Delete));
+                    state
+                        .c6
+                        .content
+                        .perform(Action::Edit(Edit::Paste(Arc::new(c6.clone()))));
+                }
+            }
+        }
+        SavePrompt(s) => todo!(),
+        RenamePrompt(s) => todo!(),
     }
     Task::none()
 }
@@ -509,7 +659,11 @@ fn handle_event(state: &mut State, e: Event) -> Task<Message> {
         },
         Event::Mouse(ref _e) => (),
         Event::Window(ref e) => match e {
-            window::Event::FileDropped(path) => return get_prompt_metadata(path),
+            window::Event::FileDropped(path) => {
+                if let Some((prompt, characters)) = get_prompt_metadata(path) {
+                    return Task::done(Message::ImportPrompt(prompt, characters));
+                }
+            }
             _ => (),
         },
         Event::Touch(_) => (),
@@ -555,7 +709,13 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
                                         .extension()
                                         .is_some_and(|s| s.to_string_lossy().ends_with("png"))
                                 {
-                                    return get_prompt_metadata(&entry.path);
+                                    if let Some((prompt, characters)) =
+                                        get_prompt_metadata(&entry.path)
+                                    {
+                                        return Task::done(Message::ImportPrompt(
+                                            prompt, characters,
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -746,6 +906,47 @@ fn view_files(state: &State) -> Element<Message> {
 }
 
 fn view_prompts(state: &State) -> Element<Message> {
+    let base_combobox = combo_box(
+        &state.base_options,
+        "base",
+        state.base_selected.as_ref(),
+        Message::BasePromptSelected,
+    );
+
+    let character_combobox = combo_box(
+        &state.char_options,
+        "character",
+        state.char_selected.as_ref(),
+        Message::CharacterPromptSelected,
+    );
+
+    let template_combobox = combo_box(
+        &state.template_options,
+        "template",
+        state.template_selected.as_ref(),
+        Message::TemplateSelected,
+    );
+
+    let char_dropdown = pick_list(
+        [
+            CharacterNum::Char1,
+            CharacterNum::Char2,
+            CharacterNum::Char3,
+            CharacterNum::Char4,
+            CharacterNum::Char5,
+            CharacterNum::Char6,
+        ],
+        Some(state.curr_char),
+        Message::CharSelected,
+    );
+
+    let prompt_boxes = row![
+        char_dropdown,
+        base_combobox,
+        character_combobox,
+        template_combobox
+    ];
+
     let text_areas = column![
         text_editor(&state.base_prompt)
             .placeholder("base prompt")
@@ -770,19 +971,6 @@ fn view_prompts(state: &State) -> Element<Message> {
             .on_action(Message::EditChar6),
     ]
     .spacing(10);
-
-    let char_dropdown = pick_list(
-        [
-            CharacterNum::Char1,
-            CharacterNum::Char2,
-            CharacterNum::Char3,
-            CharacterNum::Char4,
-            CharacterNum::Char5,
-            CharacterNum::Char6,
-        ],
-        Some(state.curr_char),
-        Message::CharSelected,
-    );
 
     use Position::*;
     let position_grid = column![
@@ -823,11 +1011,8 @@ fn view_prompts(state: &State) -> Element<Message> {
         ],
     ];
 
-    let mut content = Column::with_children([
-        text_areas.into(),
-        char_dropdown.into(),
-        position_grid.into(),
-    ]);
+    let mut content =
+        Column::with_children([prompt_boxes.into(), text_areas.into(), position_grid.into()]);
 
     content = content.push_maybe(if !state.image_gen_ip {
         Some(button("Submit").on_press(Message::SubmitRequest))
@@ -913,8 +1098,9 @@ fn delete_file(state: &mut State) -> Task<Message> {
     Task::none()
 }
 
-fn get_prompt_metadata(path: &PathBuf) -> Task<Message> {
+pub fn get_prompt_metadata<P: AsRef<std::path::Path>>(path: P) -> Option<(String, Vec<String>)> {
     if path
+        .as_ref()
         .extension()
         .map_or(false, |s| s.to_string_lossy() == "png")
     {
@@ -938,14 +1124,85 @@ fn get_prompt_metadata(path: &PathBuf) -> Task<Message> {
             for c in characters {
                 character_prompts.push(c.get("char_caption").unwrap().as_str().unwrap().to_owned());
             }
-            return Task::done(Message::ImportPrompt(prompt, character_prompts));
+            return Some((prompt, character_prompts));
         }
     }
-    Task::none()
+    None
 }
 
 pub fn subscribe(_state: &State) -> Subscription<Message> {
     event::listen().map(Message::Event)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub enum FilesMode {
+    #[default]
+    Normal,
+    Batch,
+}
+
+impl Display for FilesMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use FilesMode::*;
+        match self {
+            Normal => write!(f, "Normal"),
+            Batch => write!(f, "Batch"),
+        }
+    }
+}
+
+struct CharacterContent {
+    c: nai::Character,
+    content: text_editor::Content,
+}
+
+impl CharacterContent {
+    fn new() -> Self {
+        Self {
+            c: nai::Character::new(),
+            content: text_editor::Content::new(),
+        }
+    }
+}
+
+struct PromptHistoryEntry {
+    timestamp: u64,
+    prompt: String,
+    characters: Vec<String>,
+}
+
+impl PartialOrd for PromptHistoryEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(&other))
+    }
+}
+
+impl Ord for PromptHistoryEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.timestamp.cmp(&other.timestamp)
+    }
+}
+
+impl PartialEq for PromptHistoryEntry {
+    fn eq(&self, other: &PromptHistoryEntry) -> bool {
+        self.prompt == other.prompt && self.characters == other.characters
+    }
+}
+
+impl Eq for PromptHistoryEntry {}
+
+impl Hash for PromptHistoryEntry {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write(self.prompt.as_bytes());
+        state.write(
+            &self
+                .characters
+                .iter()
+                .flat_map(|s| s.as_bytes())
+                .copied()
+                .collect::<Vec<u8>>(),
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1057,5 +1314,37 @@ mod style {
             },
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use iced::widget::shader::wgpu::naga::FastHashSet;
+
+    #[test]
+    fn history1() {
+        let h1 = PromptHistoryEntry {
+            timestamp: 1,
+            prompt: "foobar".into(),
+            characters: vec!["foo".into()],
+        };
+        let h2 = PromptHistoryEntry {
+            timestamp: 2,
+            prompt: "foobar".into(),
+            characters: vec!["foo".into()],
+        };
+        let h3 = PromptHistoryEntry {
+            timestamp: 10,
+            prompt: "this is the newest prompt".into(),
+            characters: vec!["foo".into(), "bar".into()],
+        };
+
+        let mut set = FastHashSet::default();
+        set.insert(h1);
+        set.insert(h2);
+        set.insert(h3);
+
+        assert_eq!(set.len(), 2);
     }
 }

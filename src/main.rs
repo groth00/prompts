@@ -8,14 +8,11 @@ use image_metadata::extract_image_metadata;
 
 mod db;
 mod files;
-mod import;
 mod nai;
-mod prompt;
 mod ui;
 
-use import::import;
-use nai::{ImageGenRequest, ImageShape, Requester};
-use prompt::Character;
+use db::import_from_dir;
+use nai::{Character, ImageGenRequest, ImageShape, Requester};
 use ui::{State, subscribe, update, view};
 
 fn main() -> iced::Result {
@@ -73,7 +70,7 @@ fn main() -> iced::Result {
             }
         }
         Commands::Import { action } => match action {
-            ImportCmd::Danbooru => match import() {
+            ImportCmd::Dir { path } => match import_from_dir(path) {
                 Ok(_) => println!("import ok"),
                 Err(e) => eprintln!("import error: {}", e),
             },
@@ -104,5 +101,5 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ImportCmd {
-    Danbooru,
+    Dir { path: String },
 }

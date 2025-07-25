@@ -1,0 +1,41 @@
+CREATE TABLE IF NOT EXISTS templates(
+  id INTEGER PRIMARY KEY,
+  ts INTEGER,
+  name TEXT NOT NULL,
+  base INTEGER,
+  c1 INTEGER,
+  c2 INTEGER,
+  c3 INTEGER,
+  c4 INTEGER,
+  c5 INTEGER,
+  c6 INTEGER,
+  FOREIGN KEY(base) REFERENCES base_prompts(id),
+  FOREIGN KEY(c1) REFERENCES characters(id),
+  FOREIGN KEY(c2) REFERENCES characters(id),
+  FOREIGN KEY(c3) REFERENCES characters(id),
+  FOREIGN KEY(c4) REFERENCES characters(id),
+  FOREIGN KEY(c5) REFERENCES characters(id),
+  FOREIGN KEY(c6) REFERENCES characters(id)
+);
+
+CREATE TABLE IF NOT EXISTS base(
+  id INTEGER PRIMARY KEY,
+  ts INTEGER,
+  name TEXT NOT NULL,
+  t TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS characters(
+  id INTEGER PRIMARY KEY,
+  ts INTEGER,
+  name TEXT NOT NULL,
+  t TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS base_name ON base(name);
+CREATE INDEX IF NOT EXISTS base_ts ON base(ts);
+CREATE INDEX IF NOT EXISTS base_t ON base(t);
+
+CREATE INDEX IF NOT EXISTS char_name ON characters(name);
+CREATE INDEX IF NOT EXISTS base_ts ON base(ts);
+CREATE INDEX IF NOT EXISTS char_t ON characters(t);

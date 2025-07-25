@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS templates;
+DROP TABLE IF EXISTS base;
+DROP TABLE IF EXISTS characters;

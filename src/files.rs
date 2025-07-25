@@ -425,7 +425,7 @@ mod test {
 
         // NOTE: state.visible contains the flattened view, state.entries contains the nodes
         let entry = selected_entry(&state.entries, &state.selected);
-        assert_eq!(24, state.visible.len());
+        assert_eq!(25, state.visible.len());
         assert_eq!(
             entry,
             Some(Entry {
@@ -461,7 +461,7 @@ mod test {
     fn refresh_full() {
         let mut state = FilesState::new(".");
 
-        assert_eq!(21, state.entries.len());
+        assert_eq!(22, state.entries.len());
 
         if fs::exists("foo").expect("exists foo") {
             fs::remove_file("foo").expect("remove foo");
@@ -474,7 +474,7 @@ mod test {
 
         state.cmd(Command::Refresh);
 
-        assert_eq!(22, state.entries.len());
+        assert_eq!(23, state.entries.len());
         assert!(state.entries.contains(&Entry {
             path: PathBuf::from("./foo"),
             kind: EntryKind::Folder,
