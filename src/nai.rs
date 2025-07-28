@@ -13,7 +13,6 @@ use tokio::task::spawn_blocking;
 use zip::{read::ZipArchive, result::ZipResult};
 
 const NOVELAI_ENDPOINT: &str = "https://image.novelai.net/ai/generate-image";
-pub const BASE_PROMPT: &'static str = "year 2025, official art, 1.16::highly finished, digital illustration, smooth shading, smooth::, 1.1::masterpiece, best quality, incredibly absurdres::, uncensored, -2::patreon logo, artist signature, watermark::";
 pub const NEGATIVE_PROMPT: &'static str = "lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page, blurry, lowres, error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, logo, too many watermarks, {{{bad eyes}}}, blurry eyes, fewer, extra, missing, worst quality, watermark, unfinished, displeasing, signature, extra digits, artistic error, username, scan, bad anatomy, @_@, mismatched pupils, heart-shaped pupils, glowing eyes, low quality, {{{bad}}}, normal quality, disfigured, flower, artist signature, watermark, monochrome, black bars, cinematic bars, plaque, wall ornament, speech bubble, extra arms, extra breasts, loli, child, amputee, missing limb, 1.22::extra fingers, long fingers, missing fingers, bad hands::, extra digit, fewer digits, mutation, white border, eyes without pupils, multiple views, 1.3::disembodied penis::, x-ray, fake animal ears, animal ears, 1.1::pubic hair, female pubic hair, male pubic hair::, censored, border, 1.2::sound effects, text::";
 
 pub struct Requester {
@@ -71,7 +70,7 @@ impl Requester {
         req.parameters.seed = rand::random_range(1e9..9e9) as u64;
 
         let (bytes, end) = self.call_service(&req).await?;
-        println!("{} elapsed", end);
+        eprintln!("{} elapsed", end);
 
         let res = spawn_blocking(move || -> Result<String, ImageGenerationError> {
             let output_path =
@@ -80,7 +79,7 @@ impl Requester {
         })
         .await
         .map_err(|_e| ImageGenerationError::JoinError)??;
-        println!("{:?}", res);
+        eprintln!("{:?}", res);
 
         Ok(res)
     }
@@ -114,7 +113,7 @@ impl Requester {
                 .execute(req.try_clone().unwrap())
                 .await
                 .map_err(|e| ImageGenerationError::SendRequest(e.to_string()))?;
-            println!("{}", resp.status());
+            eprintln!("{}", resp.status());
 
             if resp.status().is_success() {
                 break resp;
@@ -127,7 +126,7 @@ impl Requester {
                 tokio::time::sleep(Duration::from_secs(wait)).await;
                 wait += 1;
                 attempts -= 1;
-                println!(
+                eprintln!(
                     "{}: {:?} ({} attempts left)",
                     resp.status(),
                     resp.text().await,

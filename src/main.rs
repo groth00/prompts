@@ -70,10 +70,12 @@ fn main() -> iced::Result {
             }
         }
         Commands::Import { action } => match action {
-            ImportCmd::Dir { path } => match import_from_dir(path) {
-                Ok(_) => println!("import ok"),
-                Err(e) => eprintln!("import error: {}", e),
-            },
+            ImportCmd::Dir { path } => runtime.block_on(async {
+                match import_from_dir(path).await {
+                    Ok(_) => eprintln!("import ok"),
+                    Err(e) => eprintln!("import error: {:?}", e),
+                }
+            }),
         },
     }
 

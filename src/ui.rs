@@ -23,13 +23,15 @@ use iced::{
         shader::wgpu::naga::FastHashMap,
         text, text_editor,
         text_editor::{Action, Edit},
+        text_input,
     },
     window,
 };
-use rusqlite::Connection;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 
 use crate::{
-    db::{Template, fetch_prompts},
+    db::{PromptKind, SqliteError, Template, fetch_prompts, save_prompt, update_prompt_name},
     files::{
         Entry, EntryKind, FilesState, entries, init_visible, selected_entry, selected_entry_mut,
         update_visible,
@@ -54,19 +56,22 @@ pub struct State {
     c6: CharacterContent,
     curr_char: CharacterNum,
 
-    conn: Connection,
+    pool: Pool<SqliteConnectionManager>,
 
     base_options: combo_box::State<String>,
     base_map: FastHashMap<String, String>,
     base_selected: Option<String>,
+    base_rename: String,
 
     char_options: combo_box::State<String>,
     char_map: FastHashMap<String, String>,
     char_selected: Option<String>,
+    char_rename: String,
 
     template_options: combo_box::State<String>,
     template_map: FastHashMap<String, Template>,
     template_selected: Option<String>,
+    template_rename: String,
 
     history: Vec<PromptHistoryEntry>,
     temp: Vec<(Vec<usize>, PathBuf)>,
@@ -79,11 +84,12 @@ pub struct State {
 
 impl Default for State {
     fn default() -> Self {
-        let mut conn =
-            Connection::open(std::env::var("SQLITE_URL").expect("missing SQLITE_URL env var"))
-                .expect("open connection");
+        let sqlite_url = std::env::var("SQLITE_URL").expect("missing SQLITE_URL env var");
+        let manager = SqliteConnectionManager::file(sqlite_url);
+        let pool = r2d2::Pool::new(manager).expect("pool");
+
         let (base_options, base_map, char_options, char_map, template_options, template_map) =
-            fetch_prompts(&mut conn).expect("fetch_prompts");
+            fetch_prompts(pool.clone()).expect("fetch_prompts");
 
         let files_pane = Pane::new(PaneId::Files);
         let prompts_pane = Pane::new(PaneId::Prompts);
@@ -114,18 +120,22 @@ impl Default for State {
             c6: CharacterContent::new(),
             curr_char: CharacterNum::Char1,
 
-            conn,
+            pool,
+
             base_options: combo_box::State::new(base_options),
             base_map,
             base_selected: None,
+            base_rename: String::new(),
 
             char_options: combo_box::State::new(char_options),
             char_map,
             char_selected: None,
+            char_rename: String::new(),
 
             template_options: combo_box::State::new(template_options),
             template_map,
             template_selected: None,
+            template_rename: String::new(),
 
             history: Vec::new(),
             temp: Vec::new(),
@@ -136,6 +146,25 @@ impl Default for State {
             client: Arc::new(Requester::default()),
         };
         state
+    }
+}
+
+impl State {
+    pub fn refresh_prompts(&mut self) {
+        let (base_options, base_map, char_options, char_map, template_options, template_map) =
+            fetch_prompts(self.pool.clone()).expect("fetch_prompts");
+
+        self.base_options = combo_box::State::new(base_options);
+        self.base_map = base_map;
+        self.base_selected = None;
+
+        self.char_options = combo_box::State::new(char_options);
+        self.char_map = char_map;
+        self.char_selected = None;
+
+        self.template_options = combo_box::State::new(template_options);
+        self.template_map = template_map;
+        self.template_selected = None;
     }
 }
 
@@ -170,17 +199,20 @@ pub enum Message {
     SetRoot,
     ImportPrompt(String, Vec<String>),
     Delete,
-    DeleteBatch,
     MoveBatch,
     FilesMode(FilesMode),
     SelectEntry,
     BasePromptSelected(String),
     CharacterPromptSelected(String),
     TemplateSelected(String),
-
-    // TODO:
-    SavePrompt(String),
-    RenamePrompt(String),
+    SavePrompt,
+    SavedPrompt(Result<(), SqliteError>),
+    EditRenameBasePrompt(String),
+    EditRenameCharacterPrompt(String),
+    EditRenameTemplate(String),
+    SubmitRenameBasePrompt,
+    SubmitRenameCharacterPrompt,
+    SubmitRenameTemplate,
 }
 
 pub fn update(state: &mut State, msg: Message) -> Task<Message> {
@@ -436,7 +468,6 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
             }
         }
         Delete => return delete_file(state),
-        DeleteBatch => (),
         MoveBatch => {
             if state.files.selected.len() == 1 {
                 return Task::done(Message::SetMessage(String::from(
@@ -631,8 +662,119 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 }
             }
         }
-        SavePrompt(s) => todo!(),
-        RenamePrompt(s) => todo!(),
+        SavePrompt => {
+            let base = state.base_prompt.text().replace("\n", " ");
+
+            let mut characters = Vec::with_capacity(6);
+            for c in [
+                state.c1.content.text().replace("\n", ""),
+                state.c2.content.text().replace("\n", ""),
+                state.c3.content.text().replace("\n", ""),
+                state.c4.content.text().replace("\n", ""),
+                state.c5.content.text().replace("\n", ""),
+                state.c6.content.text().replace("\n", ""),
+            ] {
+                if !c.is_empty() {
+                    characters.push(c.clone());
+                }
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("duration_since")
+                .as_secs() as i64;
+
+            let pool = state.pool.clone();
+            return Task::perform(
+                async move { save_prompt(pool, vec![(now, base, characters)]).await },
+                |r| Message::SavedPrompt(r),
+            );
+        }
+        SavedPrompt(r) => {
+            if let Err(e) = r {
+                return Task::done(Message::SetMessage(e.err));
+            } else {
+                state.refresh_prompts();
+                return Task::done(Message::SetMessage("saved prompt".into()));
+            };
+        }
+        SubmitRenameBasePrompt => {
+            if let Some(old_name) = &state.base_selected {
+                let new_name = state.base_rename.clone();
+                let mut new_options = state.base_options.options().to_vec();
+                new_options.remove(new_options.iter().position(|s| s == old_name).unwrap());
+                new_options.push(new_name.clone());
+                state.base_options = combo_box::State::new(new_options);
+
+                let old_val = state.base_map.remove(&old_name.clone());
+                state.base_map.insert(new_name.clone(), old_val.unwrap());
+
+                let r = update_prompt_name(
+                    state.pool.clone(),
+                    PromptKind::Base,
+                    old_name.clone(),
+                    new_name,
+                );
+                let message = if let Err(e) = r {
+                    e.to_string()
+                } else {
+                    "renamed base prompt".into()
+                };
+                return Task::done(Message::SetMessage(message));
+            }
+        }
+        SubmitRenameCharacterPrompt => {
+            if let Some(old_name) = &state.char_selected {
+                let new_name = state.char_rename.clone();
+                let mut new_options = state.char_options.options().to_vec();
+                new_options.remove(new_options.iter().position(|s| s == old_name).unwrap());
+                new_options.push(new_name.clone());
+                state.char_options = combo_box::State::new(new_options);
+
+                let old_val = state.char_map.remove(&old_name.clone());
+                state.char_map.insert(new_name.clone(), old_val.unwrap());
+
+                let pool = state.pool.clone();
+                let r = update_prompt_name(pool, PromptKind::Character, old_name.clone(), new_name);
+                let message = if let Err(e) = r {
+                    e.to_string()
+                } else {
+                    "renamed character prompt".into()
+                };
+                return Task::done(Message::SetMessage(message));
+            }
+        }
+        SubmitRenameTemplate => {
+            if let Some(old_name) = &state.template_selected {
+                let new_name = state.template_rename.clone();
+                let mut new_options = state.template_options.options().to_vec();
+                new_options.remove(new_options.iter().position(|s| s == old_name).unwrap());
+                new_options.push(new_name.clone());
+                state.template_options = combo_box::State::new(new_options);
+
+                let old_val = state.template_map.remove(&old_name.clone());
+                state
+                    .template_map
+                    .insert(new_name.clone(), old_val.unwrap());
+
+                let pool = state.pool.clone();
+                let r = update_prompt_name(pool, PromptKind::Template, old_name.clone(), new_name);
+                let message = if let Err(e) = r {
+                    e.to_string()
+                } else {
+                    "renamed template".into()
+                };
+                return Task::done(Message::SetMessage(message));
+            }
+        }
+        EditRenameBasePrompt(s) => {
+            state.base_rename = s;
+        }
+        EditRenameCharacterPrompt(s) => {
+            state.char_rename = s;
+        }
+        EditRenameTemplate(s) => {
+            state.template_rename = s;
+        }
     }
     Task::none()
 }
@@ -743,9 +885,6 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
                         }
                         Key::Character("m") => {
                             return Task::done(Message::MoveBatch);
-                        }
-                        Key::Character("d") => {
-                            return Task::done(Message::DeleteBatch);
                         }
                         _ => (),
                     },
@@ -905,6 +1044,7 @@ fn view_files(state: &State) -> Element<Message> {
     scrollable(column![col, mode]).into()
 }
 
+// TODO: on_input for combo boxes
 fn view_prompts(state: &State) -> Element<Message> {
     let base_combobox = combo_box(
         &state.base_options,
@@ -946,6 +1086,18 @@ fn view_prompts(state: &State) -> Element<Message> {
         character_combobox,
         template_combobox
     ];
+
+    let save_prompt = button(text("Save Prompt")).on_press(Message::SavePrompt);
+    let base_rename = text_input("rename base_prompt", &state.base_rename)
+        .on_input(Message::EditRenameBasePrompt)
+        .on_submit(Message::SubmitRenameBasePrompt);
+    let char_rename = text_input("rename character_prompt", &state.char_rename)
+        .on_input(Message::EditRenameCharacterPrompt)
+        .on_submit(Message::SubmitRenameCharacterPrompt);
+    let template_rename = text_input("rename template", &state.template_rename)
+        .on_input(Message::EditRenameTemplate)
+        .on_submit(Message::SubmitRenameTemplate);
+    let save_rename = row![save_prompt, base_rename, char_rename, template_rename];
 
     let text_areas = column![
         text_editor(&state.base_prompt)
@@ -1011,8 +1163,12 @@ fn view_prompts(state: &State) -> Element<Message> {
         ],
     ];
 
-    let mut content =
-        Column::with_children([prompt_boxes.into(), text_areas.into(), position_grid.into()]);
+    let mut content = Column::with_children([
+        prompt_boxes.into(),
+        save_rename.into(),
+        text_areas.into(),
+        position_grid.into(),
+    ]);
 
     content = content.push_maybe(if !state.image_gen_ip {
         Some(button("Submit").on_press(Message::SubmitRequest))

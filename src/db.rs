@@ -1,10 +1,23 @@
 use std::{fs, path::Path, time::UNIX_EPOCH};
 
 use iced::widget::shader::wgpu::naga::FastHashMap;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rand::distr::{Alphanumeric, SampleString};
 use rusqlite::{Connection, Error, OptionalExtension, params};
 
 use crate::ui::get_prompt_metadata;
+
+#[derive(Debug, Clone)]
+pub struct SqliteError {
+    pub err: String,
+}
+
+impl SqliteError {
+    pub fn new(e: rusqlite::Error) -> Self {
+        Self { err: e.to_string() }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
@@ -49,8 +62,26 @@ pub struct PromptDb {
     pub prompt: String,
 }
 
+pub fn update_prompt_name(
+    pool: Pool<SqliteConnectionManager>,
+    table: PromptKind,
+    old_name: String,
+    new_name: String,
+) -> Result<usize, Error> {
+    let table_name = match table {
+        PromptKind::Character => "characters",
+        PromptKind::Base => "base",
+        PromptKind::Template => "templates",
+        _ => unreachable!(),
+    };
+    let update = format!("UPDATE {} SET name = ?1 WHERE name = ?2", table_name);
+
+    let conn = pool.get().unwrap();
+    conn.execute(&update, [&new_name, &old_name])
+}
+
 pub fn fetch_prompts(
-    conn: &mut Connection,
+    pool: Pool<SqliteConnectionManager>,
 ) -> Result<
     (
         Vec<String>,
@@ -62,6 +93,7 @@ pub fn fetch_prompts(
     ),
     Error,
 > {
+    let conn = pool.get().unwrap();
     let mut s_base = conn.prepare("SELECT name, t FROM base ORDER BY ts DESC")?;
     let mut s_char = conn.prepare("SELECT name, t FROM characters ORDER BY ts DESC")?;
     let mut s_templates = conn.prepare(include_str!("../sql/s_template_all.sql"))?;
@@ -177,11 +209,12 @@ pub fn load_prompt(
     Ok(ret)
 }
 
-pub fn save_prompt(
-    conn: &mut Connection,
-    metadata: &Vec<(i64, String, Vec<String>)>,
-) -> Result<(), Error> {
-    let tx = conn.transaction()?;
+pub async fn save_prompt(
+    pool: Pool<SqliteConnectionManager>,
+    metadata: Vec<(i64, String, Vec<String>)>,
+) -> Result<(), SqliteError> {
+    let mut conn = pool.get().unwrap();
+    let tx = conn.transaction().map_err(|e| SqliteError::new(e))?;
     let insert_base = include_str!("../sql/i_base.sql");
     let insert_char = include_str!("../sql/i_char.sql");
     let insert_template = include_str!("../sql/i_template.sql");
@@ -191,11 +224,13 @@ pub fn save_prompt(
     let mut rng = rand::rng();
 
     {
-        let mut base = tx.prepare(insert_base)?;
-        let mut char = tx.prepare(insert_char)?;
-        let mut template = tx.prepare(insert_template)?;
-        let mut select_base = tx.prepare(select_base)?;
-        let mut select_char = tx.prepare(select_char)?;
+        let mut base = tx.prepare(insert_base).map_err(|e| SqliteError::new(e))?;
+        let mut char = tx.prepare(insert_char).map_err(|e| SqliteError::new(e))?;
+        let mut template = tx
+            .prepare(insert_template)
+            .map_err(|e| SqliteError::new(e))?;
+        let mut select_base = tx.prepare(select_base).map_err(|e| SqliteError::new(e))?;
+        let mut select_char = tx.prepare(select_char).map_err(|e| SqliteError::new(e))?;
 
         for (ts, prompt, characters) in metadata {
             let name = Alphanumeric.sample_string(&mut rng, 8);
@@ -205,12 +240,15 @@ pub fn save_prompt(
                 .optional()
             {
                 Ok(Some(id)) => Ok(id),
-                Ok(None) => Ok(select_base.query_row(params![prompt], |r| r.get::<usize, i64>(0))?),
-                Err(e) => Err(e),
+                Ok(None) => Ok(select_base
+                    .query_row(params![prompt], |r| r.get::<usize, i64>(0))
+                    .map_err(|e| SqliteError::new(e)))?,
+                Err(e) => Err(SqliteError::new(e)),
             }?;
 
-            let mut c: Vec<Option<i64>> =
-                characters.iter().try_fold(Vec::new(), |mut acc, s| {
+            let mut c: Vec<Option<i64>> = characters
+                .iter()
+                .try_fold(Vec::new(), |mut acc, s| {
                     let name = Alphanumeric.sample_string(&mut rng, 8);
 
                     match char
@@ -223,7 +261,8 @@ pub fn save_prompt(
                         )),
                     }
                     Ok::<Vec<Option<i64>>, Error>(acc)
-                })?;
+                })
+                .map_err(|e| SqliteError::new(e))?;
 
             let mut count = 6 - c.len();
             while count > 0 {
@@ -231,18 +270,21 @@ pub fn save_prompt(
                 count -= 1;
             }
 
-            template.execute(params![ts, name, b, c[0], c[1], c[2], c[3], c[4], c[5]])?;
-            println!("inserted {}", name);
+            template
+                .execute(params![ts, name, b, c[0], c[1], c[2], c[3], c[4], c[5]])
+                .map_err(|e| SqliteError::new(e))?;
+            eprintln!("inserted {}", name);
         }
     }
 
-    tx.commit()?;
+    tx.commit().map_err(|e| SqliteError::new(e))?;
 
     Ok(())
 }
 
-pub fn import_from_dir<P: AsRef<Path>>(dir: P) -> Result<usize, Error> {
+pub async fn import_from_dir<P: AsRef<Path>>(dir: P) -> Result<usize, SqliteError> {
     let mut metadata: Vec<(i64, String, Vec<String>)> = vec![];
+    let len = metadata.len();
     let mut read_dir = fs::read_dir(dir).expect("read_dir");
     while let Some(Ok(entry)) = read_dir.next() {
         if let Ok(meta) = entry.metadata() {
@@ -258,9 +300,10 @@ pub fn import_from_dir<P: AsRef<Path>>(dir: P) -> Result<usize, Error> {
         }
     }
 
-    let mut conn = Connection::open(std::env::var("SQLITE_URL").expect("set SQLITE_URL in .env"))?;
+    let manager = SqliteConnectionManager::file(std::env::var("SQLITE_URL").unwrap());
+    let pool = r2d2::Pool::new(manager).unwrap();
 
-    save_prompt(&mut conn, &metadata)?;
+    save_prompt(pool, metadata).await?;
 
-    Ok(metadata.len())
+    Ok(len)
 }
