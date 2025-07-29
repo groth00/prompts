@@ -7,6 +7,15 @@
 - Added
 save prompt
 rename templates/base/character in ui
+seed from the latest generated image
+image history via thumbnails (scrollable)
+  - store both the original and resized in VecDeque so we can push new images to the front
+  - update ImageGenerated message
+  - use image::imageops::resize with some wh, filtertype Nearest
+  - scrollable of Vec<MouseArea<Image>>, in the view function enumerate to set index, on_left_click view image in pane and on_right_click extract metadata and set in prompts pane
+  - precedence of selected image in file pane over selected thumbnail
+  - track position of image, and alter style to show selected thumbnail
+
 
 2025-07-24 to 2025-07-25
 - Added

@@ -1,12 +1,15 @@
 use std::{
+    collections::VecDeque,
     fmt::{self, Display},
     fs,
     hash::{Hash, Hasher},
+    io::Cursor,
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use iced::{
     Element, Event,
     Length::{self},
@@ -18,6 +21,7 @@ use iced::{
     widget::{
         Column, Image, PaneGrid, button, center, column, combo_box, container,
         image::Handle,
+        mouse_area,
         pane_grid::{self, Axis, Configuration, Direction},
         pick_list, row, scrollable,
         shader::wgpu::naga::FastHashMap,
@@ -27,8 +31,12 @@ use iced::{
     },
     window,
 };
+use image::ImageReader;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use rand::{Rng, rngs::ThreadRng};
+use serde_json::{Map, Value};
+use zip::ZipArchive;
 
 use crate::{
     db::{PromptKind, SqliteError, Template, fetch_prompts, save_prompt, update_prompt_name},
@@ -47,6 +55,9 @@ pub struct State {
     message: Option<String>,
     panes: pane_grid::State<Pane>,
     focus: Option<pane_grid::Pane>,
+
+    rng: ThreadRng,
+
     base_prompt: text_editor::Content,
     c1: CharacterContent,
     c2: CharacterContent,
@@ -73,13 +84,19 @@ pub struct State {
     template_selected: Option<String>,
     template_rename: String,
 
-    history: Vec<PromptHistoryEntry>,
+    previous_seed: u64,
+    current_seed: Option<u64>,
+
+    // history: Vec<PromptHistoryEntry>,
     temp: Vec<(Vec<usize>, PathBuf)>,
     files_mode: FilesMode,
     image_gen_ip: bool,
     cache: FastHashMap<PathBuf, Handle>,
     files: FilesState,
     client: Arc<Requester>,
+    images: VecDeque<Vec<u8>>,
+    selected_image: Option<usize>,
+    thumbnails: VecDeque<Handle>,
 }
 
 impl Default for State {
@@ -111,6 +128,9 @@ impl Default for State {
             message: None,
             panes,
             focus: None,
+
+            rng: rand::rng(),
+
             base_prompt: text_editor::Content::new(),
             c1: CharacterContent::new(),
             c2: CharacterContent::new(),
@@ -137,13 +157,20 @@ impl Default for State {
             template_selected: None,
             template_rename: String::new(),
 
-            history: Vec::new(),
+            previous_seed: 0,
+            current_seed: None,
+
+            // history: Vec::new(),
             temp: Vec::new(),
             files_mode: FilesMode::Normal,
             image_gen_ip: false,
             cache: FastHashMap::default(),
             files: FilesState::new("."),
             client: Arc::new(Requester::default()),
+
+            images: VecDeque::new(),
+            selected_image: None,
+            thumbnails: VecDeque::new(),
         };
         state
     }
@@ -185,7 +212,7 @@ pub enum Message {
     EditChar4(text_editor::Action),
     EditChar5(text_editor::Action),
     EditChar6(text_editor::Action),
-    ImageGenerated(Result<String, ImageGenerationError>),
+    ImageGenerated(Result<(Bytes, String), ImageGenerationError>),
     CharSelected(CharacterNum),
     SetPosition(Position),
     SubmitRequest,
@@ -213,6 +240,10 @@ pub enum Message {
     SubmitRenameBasePrompt,
     SubmitRenameCharacterPrompt,
     SubmitRenameTemplate,
+    CopySeed,
+    ClearSeed,
+    ImageClicked(usize),
+    MetadataFromImage(usize),
 }
 
 pub fn update(state: &mut State, msg: Message) -> Task<Message> {
@@ -277,6 +308,10 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
 
             let mut req = ImageGenRequest::default();
             req.prompt(state.base_prompt.text());
+            let new_seed = state.rng.random_range(1e9..9e9) as u64;
+            req.seed(state.current_seed.unwrap_or(new_seed));
+            state.previous_seed = new_seed;
+            state.current_seed = None;
 
             for c in [
                 &mut state.c1,
@@ -294,15 +329,6 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 c.c.prompt(c.content.text());
                 req.add_character(&c.c);
             }
-
-            state.history.push(PromptHistoryEntry {
-                timestamp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                prompt: req.get_prompt(),
-                characters: req.get_characters(),
-            });
 
             if [
                 state.c1.c.get_center(),
@@ -325,14 +351,38 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                     r.generate_image(crate::nai::ImageShape::Portrait, req)
                         .await
                 },
-                |res| Message::ImageGenerated(res),
+                |r| Message::ImageGenerated(r),
             );
         }
         ImageGenerated(res) => {
             state.image_gen_ip = false;
             match res {
                 Err(e) => state.message = Some(e.to_string()),
-                Ok(s) => state.message = Some(s),
+                Ok((bytes, path)) => {
+                    state.message = Some(path);
+
+                    let reader = Cursor::new(bytes);
+                    let mut archive = ZipArchive::new(reader).unwrap();
+                    let mut file = archive.by_index(0).unwrap();
+
+                    let mut buf = Vec::with_capacity(file.size() as usize);
+                    std::io::copy(&mut file, &mut buf).unwrap();
+
+                    let mut reader = ImageReader::new(Cursor::new(&buf));
+                    reader.set_format(image::ImageFormat::Png);
+                    if let Ok(im) = reader.decode() {
+                        let resized = image::imageops::resize(
+                            &im.to_rgba8(),
+                            64,
+                            64,
+                            image::imageops::FilterType::Nearest,
+                        );
+                        let dims = resized.dimensions();
+                        let thumb_handle = Handle::from_rgba(dims.0, dims.1, resized.into_raw());
+                        state.thumbnails.push_front(thumb_handle);
+                        state.images.push_front(buf);
+                    }
+                }
             }
         }
         ToggleExpand(path) => {
@@ -405,68 +455,7 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 }
             }
         }
-        ImportPrompt(base, characters) => {
-            use text_editor::{Action, Edit};
-            state.base_prompt.perform(Action::SelectAll);
-            state.base_prompt.perform(Action::Edit(Edit::Delete));
-            state
-                .base_prompt
-                .perform(Action::Edit(Edit::Paste(Arc::new(base))));
-
-            for (i, c) in characters.iter().enumerate() {
-                match i {
-                    0 => {
-                        state.c1.content.perform(Action::SelectAll);
-                        state.c1.content.perform(Action::Edit(Edit::Delete));
-                        state
-                            .c1
-                            .content
-                            .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
-                    }
-                    1 => {
-                        state.c2.content.perform(Action::SelectAll);
-                        state.c2.content.perform(Action::Edit(Edit::Delete));
-                        state
-                            .c2
-                            .content
-                            .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
-                    }
-                    2 => {
-                        state.c3.content.perform(Action::SelectAll);
-                        state.c3.content.perform(Action::Edit(Edit::Delete));
-                        state
-                            .c3
-                            .content
-                            .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
-                    }
-                    3 => {
-                        state.c4.content.perform(Action::SelectAll);
-                        state.c4.content.perform(Action::Edit(Edit::Delete));
-                        state
-                            .c4
-                            .content
-                            .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
-                    }
-                    4 => {
-                        state.c5.content.perform(Action::SelectAll);
-                        state.c5.content.perform(Action::Edit(Edit::Delete));
-                        state
-                            .c5
-                            .content
-                            .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
-                    }
-                    5 => {
-                        state.c6.content.perform(Action::SelectAll);
-                        state.c6.content.perform(Action::Edit(Edit::Delete));
-                        state
-                            .c6
-                            .content
-                            .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
-                    }
-                    _ => (),
-                }
-            }
-        }
+        ImportPrompt(base, characters) => set_prompt_characters(state, base, characters),
         Delete => return delete_file(state),
         MoveBatch => {
             if state.files.selected.len() == 1 {
@@ -775,6 +764,20 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
         EditRenameTemplate(s) => {
             state.template_rename = s;
         }
+        ClearSeed => state.current_seed = None,
+        CopySeed => state.current_seed = Some(state.previous_seed),
+        ImageClicked(i) => state.selected_image = Some(i),
+        MetadataFromImage(i) => {
+            if let Some(bytes) = state.images.get(i) {
+                let reader = ImageReader::new(Cursor::new(bytes));
+                if let Ok(im) = reader.decode() {
+                    if let Ok(metadata) = extract_image_metadata(im) {
+                        let (base, characters) = get_prompt_characters(metadata);
+                        set_prompt_characters(state, base, characters);
+                    }
+                }
+            }
+        }
     }
     Task::none()
 }
@@ -1044,7 +1047,6 @@ fn view_files(state: &State) -> Element<Message> {
     scrollable(column![col, mode]).into()
 }
 
-// TODO: on_input for combo boxes
 fn view_prompts(state: &State) -> Element<Message> {
     let base_combobox = combo_box(
         &state.base_options,
@@ -1163,11 +1165,24 @@ fn view_prompts(state: &State) -> Element<Message> {
         ],
     ];
 
+    let previous_seed = text(format!("previous seed: {}", state.previous_seed));
+    let current_seed = text(format!(
+        "current seed: {}",
+        state.current_seed.unwrap_or_default()
+    ));
+    let copy_seed = button(text("Use Previous Seed")).on_press(Message::CopySeed);
+    let clear_seed = button(text("Clear Seed")).on_press(Message::ClearSeed);
+    let seed = row![
+        column![previous_seed, copy_seed],
+        column![current_seed, clear_seed]
+    ];
+
     let mut content = Column::with_children([
         prompt_boxes.into(),
         save_rename.into(),
         text_areas.into(),
         position_grid.into(),
+        seed.into(),
     ]);
 
     content = content.push_maybe(if !state.image_gen_ip {
@@ -1186,15 +1201,52 @@ fn view_prompts(state: &State) -> Element<Message> {
 }
 
 fn view_image(state: &State) -> Element<Message> {
-    let fallback = center(text("nothing to see here")).into();
-    let notfound = center(text("no image")).into();
+    let file_pane_image: Option<Element<Message>> =
+        selected_entry(&state.files.entries, &state.files.selected).map_or(None, |e| {
+            state
+                .cache
+                .get(&e.path)
+                .map_or(None, |h| Some(Image::new(h).into()))
+        });
 
-    selected_entry(&state.files.entries, &state.files.selected).map_or(fallback, |e| {
-        state
-            .cache
-            .get(&e.path)
-            .map_or(notfound, |h| center(Image::new(h)).into())
-    })
+    let mut thumbs = Column::with_capacity(state.thumbnails.len());
+    for (index, handle) in state.thumbnails.iter().enumerate() {
+        let style = if let Some(i) = state.selected_image {
+            if i == index {
+                container::bordered_box
+            } else {
+                container::rounded_box
+            }
+        } else {
+            container::rounded_box
+        };
+
+        let im = Image::new(handle);
+        let border = container(im).style(style);
+        let clickable = mouse_area(border)
+            .on_press(Message::ImageClicked(index))
+            .on_right_press(Message::MetadataFromImage(index));
+        thumbs = thumbs.push(clickable);
+    }
+
+    let final_image: Element<Message> = if let Some(image) = file_pane_image {
+        image
+    } else if !state.images.is_empty() {
+        if let Some(i) = state.selected_image {
+            Image::new(Handle::from_bytes(state.images[i].clone())).into()
+        } else {
+            text("invalid selected image").into()
+        }
+    } else {
+        text("nothing to see here").into()
+    };
+
+    let image_history = scrollable(thumbs);
+    row![
+        center(final_image),
+        column![text("image history"), image_history]
+    ]
+    .into()
 }
 
 fn view_controls<'a>(pane: pane_grid::Pane, is_maximized: bool) -> Element<'a, Message> {
@@ -1254,33 +1306,101 @@ fn delete_file(state: &mut State) -> Task<Message> {
     Task::none()
 }
 
+fn set_prompt_characters(state: &mut State, base: String, characters: Vec<String>) {
+    state.base_prompt.perform(Action::SelectAll);
+    state.base_prompt.perform(Action::Edit(Edit::Delete));
+    state
+        .base_prompt
+        .perform(Action::Edit(Edit::Paste(Arc::new(base))));
+
+    for (i, c) in characters.iter().enumerate() {
+        match i {
+            0 => {
+                state.c1.content.perform(Action::SelectAll);
+                state.c1.content.perform(Action::Edit(Edit::Delete));
+                state
+                    .c1
+                    .content
+                    .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
+            }
+            1 => {
+                state.c2.content.perform(Action::SelectAll);
+                state.c2.content.perform(Action::Edit(Edit::Delete));
+                state
+                    .c2
+                    .content
+                    .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
+            }
+            2 => {
+                state.c3.content.perform(Action::SelectAll);
+                state.c3.content.perform(Action::Edit(Edit::Delete));
+                state
+                    .c3
+                    .content
+                    .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
+            }
+            3 => {
+                state.c4.content.perform(Action::SelectAll);
+                state.c4.content.perform(Action::Edit(Edit::Delete));
+                state
+                    .c4
+                    .content
+                    .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
+            }
+            4 => {
+                state.c5.content.perform(Action::SelectAll);
+                state.c5.content.perform(Action::Edit(Edit::Delete));
+                state
+                    .c5
+                    .content
+                    .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
+            }
+            5 => {
+                state.c6.content.perform(Action::SelectAll);
+                state.c6.content.perform(Action::Edit(Edit::Delete));
+                state
+                    .c6
+                    .content
+                    .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
+            }
+            _ => (),
+        }
+    }
+}
+
+fn get_prompt_characters(meta: Map<String, Value>) -> (String, Vec<String>) {
+    let caption = meta
+        .get("Comment")
+        .unwrap()
+        .get("v4_prompt")
+        .unwrap()
+        .get("caption")
+        .unwrap();
+    let prompt = caption
+        .get("base_caption")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let characters = caption.get("char_captions").unwrap().as_array().unwrap();
+
+    let mut character_prompts = Vec::with_capacity(6);
+    for c in characters {
+        character_prompts.push(c.get("char_caption").unwrap().as_str().unwrap().to_owned());
+    }
+    (prompt, character_prompts)
+}
+
 pub fn get_prompt_metadata<P: AsRef<std::path::Path>>(path: P) -> Option<(String, Vec<String>)> {
     if path
         .as_ref()
         .extension()
         .map_or(false, |s| s.to_string_lossy() == "png")
     {
-        if let Ok(meta) = extract_image_metadata(&path) {
-            let caption = meta
-                .get("Comment")
-                .unwrap()
-                .get("v4_prompt")
-                .unwrap()
-                .get("caption")
-                .unwrap();
-            let prompt = caption
-                .get("base_caption")
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .to_owned();
-            let characters = caption.get("char_captions").unwrap().as_array().unwrap();
-
-            let mut character_prompts = Vec::with_capacity(6);
-            for c in characters {
-                character_prompts.push(c.get("char_caption").unwrap().as_str().unwrap().to_owned());
+        if let Ok(im) = image::open(path) {
+            if let Ok(meta) = extract_image_metadata(im) {
+                return Some(get_prompt_characters(meta));
             }
-            return Some((prompt, character_prompts));
         }
     }
     None

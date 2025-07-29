@@ -65,23 +65,23 @@ impl Requester {
         &self,
         shape: ImageShape,
         mut req: ImageGenRequest<'a>,
-    ) -> Result<String, ImageGenerationError> {
+    ) -> Result<(Bytes, String), ImageGenerationError> {
         req.height_width(shape);
-        req.parameters.seed = rand::random_range(1e9..9e9) as u64;
 
         let (bytes, end) = self.call_service(&req).await?;
         eprintln!("{} elapsed", end);
 
+        let bytes_clone = bytes.clone();
         let res = spawn_blocking(move || -> Result<String, ImageGenerationError> {
-            let output_path =
-                save_image(bytes).map_err(|e| ImageGenerationError::ZipError(e.to_string()))?;
+            let output_path = save_image(bytes_clone)
+                .map_err(|e| ImageGenerationError::ZipError(e.to_string()))?;
             Ok(output_path)
         })
         .await
         .map_err(|_e| ImageGenerationError::JoinError)??;
         eprintln!("{:?}", res);
 
-        Ok(res)
+        Ok((bytes, res))
     }
 
     pub async fn call_service<'a>(
@@ -194,6 +194,10 @@ impl<'a> ImageGenRequest<'a> {
     pub fn height_width(&mut self, shape: ImageShape) {
         self.parameters.width = shape.as_width_height().0;
         self.parameters.height = shape.as_width_height().1;
+    }
+
+    pub fn seed(&mut self, seed: u64) {
+        self.parameters.seed = seed;
     }
 
     pub fn prompt(&mut self, prompt: String) {

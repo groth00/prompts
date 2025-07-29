@@ -41,6 +41,7 @@ fn main() -> iced::Result {
             let mut req = ImageGenRequest::default();
             let mut base_prompt = "";
             let mut chars = vec![];
+            req.seed(rand::random_range(1e9..9e9) as u64);
 
             for (i, s) in s.lines().enumerate() {
                 if i == 0 {
@@ -63,7 +64,8 @@ fn main() -> iced::Result {
             });
         }
         Commands::Metadata { path } => {
-            if let Ok(map) = extract_image_metadata(path) {
+            let im = image::open(path).expect("open");
+            if let Ok(map) = extract_image_metadata(im) {
                 if let Ok(ser) = serde_json::to_string_pretty(&map) {
                     println!("{:?}", ser);
                 }

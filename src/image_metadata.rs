@@ -1,6 +1,7 @@
-use std::{error::Error, io::Read, path::Path};
+use std::{error::Error, io::Read};
 
 use flate2::read::GzDecoder;
+use image::DynamicImage;
 use ndarray::Array2;
 use serde_json::{Map, Value};
 
@@ -12,8 +13,8 @@ struct LSBExtractor {
 }
 
 impl LSBExtractor {
-    fn new<P: AsRef<Path>>(path: P) -> Self {
-        let data = byteize(path).expect("something went wrong");
+    fn new(im: DynamicImage) -> Self {
+        let data = byteize(im).expect("something went wrong");
 
         Self { data, pos: 0 }
     }
@@ -34,9 +35,8 @@ impl LSBExtractor {
     }
 }
 
-fn byteize<P: AsRef<Path>>(path: P) -> Result<Vec<u8>, Box<dyn Error>> {
-    let img = image::open(path)?;
-    let img = img.to_rgba8();
+fn byteize(im: DynamicImage) -> Result<Vec<u8>, Box<dyn Error>> {
+    let img = im.to_rgba8();
 
     let (width, height) = img.dimensions();
     let mut alpha = Array2::<u8>::zeros((height as usize, width as usize));
@@ -67,10 +67,8 @@ fn byteize<P: AsRef<Path>>(path: P) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(packed)
 }
 
-pub fn extract_image_metadata<P: AsRef<Path>>(
-    path: P,
-) -> Result<Map<String, Value>, Box<dyn Error>> {
-    let mut reader = LSBExtractor::new(path);
+pub fn extract_image_metadata(im: DynamicImage) -> Result<Map<String, Value>, Box<dyn Error>> {
+    let mut reader = LSBExtractor::new(im);
     let magic = String::from_utf8(reader.read_n(MAGIC.len()).to_vec()).expect("invalid utf-8");
     assert_eq!(magic, MAGIC);
 
