@@ -22,8 +22,6 @@ impl SqliteError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     Template,
-    CharacterPrompt,
-    BasePrompt,
     Character,
     Base,
 }
@@ -62,7 +60,6 @@ pub fn update_prompt_name(
         PromptKind::Character => "characters",
         PromptKind::Base => "base",
         PromptKind::Template => "templates",
-        _ => unreachable!(),
     };
     let update = format!("UPDATE {} SET name = ?1 WHERE name = ?2", table_name);
 
@@ -167,12 +164,10 @@ pub fn load_prompt(
     let s_base = "SELECT t FROM base WHERE name = ?1";
 
     let ret = match kind {
-        PromptKind::BasePrompt => {
-            PromptData::BasePrompt(
-                conn.query_one(s_base, params![name], |r| r.get::<usize, String>(0))?,
-            )
-        }
-        PromptKind::CharacterPrompt => {
+        PromptKind::Base => PromptData::BasePrompt(
+            conn.query_one(s_base, params![name], |r| r.get::<usize, String>(0))?,
+        ),
+        PromptKind::Character => {
             PromptData::CharacterPrompt(
                 conn.query_one(s_char, params![name], |r| r.get::<usize, String>(0))?,
             )
@@ -192,7 +187,6 @@ pub fn load_prompt(
                 })
             })?)
         }
-        _ => unreachable!(),
     };
 
     Ok(ret)
@@ -269,6 +263,41 @@ pub async fn save_prompt(
     tx.commit().map_err(|e| SqliteError::new(e))?;
 
     Ok(())
+}
+
+pub async fn update_prompt(
+    pool: Pool<SqliteConnectionManager>,
+    kind: PromptKind,
+    name: String,
+    content: String,
+) -> Result<(), SqliteError> {
+    let conn = pool.get().unwrap();
+    let query = match kind {
+        PromptKind::Base => "UPDATE base SET t = ?1 WHERE name = ?2",
+        PromptKind::Character => "UPDATE characters SET t = ?1 WHERE name = ?2",
+        _ => unreachable!(),
+    };
+    match conn.execute(query, &[&content, &name]) {
+        Ok(_rows_changed) => Ok(()),
+        Err(e) => Err(SqliteError::new(e)),
+    }
+}
+
+pub async fn delete_prompt(
+    pool: Pool<SqliteConnectionManager>,
+    kind: PromptKind,
+    name: String,
+) -> Result<(), SqliteError> {
+    let conn = pool.get().unwrap();
+    let query = match kind {
+        PromptKind::Base => "DELETE FROM base WHERE name = ?1",
+        PromptKind::Character => "DELETE FROM characters WHERE name = ?1",
+        PromptKind::Template => "DELETE FROM templates WHERE name = ?1",
+    };
+    match conn.execute(query, &[&name]) {
+        Ok(_rows_changed) => Ok(()),
+        Err(e) => Err(SqliteError::new(e)),
+    }
 }
 
 pub async fn import_from_dir<P: AsRef<Path>>(dir: P) -> Result<usize, SqliteError> {

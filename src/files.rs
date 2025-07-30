@@ -141,6 +141,7 @@ pub struct FilesState {
     pub visible: Vec<VisibleEntry>,
     // control how many entries to render
     pub view_offset: usize,
+    pub flags: u64,
 }
 
 impl FilesState {
@@ -220,9 +221,22 @@ impl FilesState {
             selected: vec![0],
             visible: vec![],
             view_offset: 0,
+            flags: 0,
         };
         init_visible(&state.entries, &mut state.visible, 0, vec![]);
         state
+    }
+
+    pub fn set_create_folder(&mut self) {
+        self.flags |= 1;
+    }
+
+    pub fn clear_create_folder(&mut self) {
+        self.flags &= 0xFFFF_FFFE;
+    }
+
+    pub fn create_folder(&self) -> bool {
+        self.flags & 1 == 1
     }
 }
 

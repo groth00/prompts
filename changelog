@@ -3,14 +3,26 @@
 - Changed
 - Removed
 
+2025-07-30
+- Added
+update and delete base/char/template
+files pane create folder
+
+- Fixed
+scale thumbnails correctly
+clear rename input on submit
+- use splice to insert new name in options
 
 2025-07-29
+- Added
 image history deletion
   - bind to shift + d while image pane is focused and check state.selected_image
     - trash file, remove from state.images and state.thumbnails
     - decrement index; saturate at 0
 add option to change orientation of image
 set seed when right clicking image
+batch image creation
+  - NOTE: in the UI this stores the initial seed which is discarded when generating N new seeds
 
 
 2025-07-28

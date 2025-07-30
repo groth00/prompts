@@ -31,7 +31,7 @@ use iced::{
     },
     window,
 };
-use image::ImageReader;
+use image::{GenericImageView, ImageReader};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rand::{Rng, distr::Uniform, rngs::ThreadRng};
@@ -40,7 +40,10 @@ use tokio::sync::Semaphore;
 use zip::ZipArchive;
 
 use crate::{
-    db::{PromptKind, SqliteError, Template, fetch_prompts, save_prompt, update_prompt_name},
+    db::{
+        PromptKind, SqliteError, Template, delete_prompt, fetch_prompts, save_prompt,
+        update_prompt, update_prompt_name,
+    },
     files::{
         Entry, EntryKind, FilesState, entries, init_visible, selected_entry, selected_entry_mut,
         update_visible,
@@ -78,6 +81,8 @@ pub struct State {
 
     temp: Vec<(Vec<usize>, PathBuf)>,
     files_mode: FilesMode,
+    new_folder_name: String,
+
     image_gen_ip: bool,
     cache: FastHashMap<PathBuf, Handle>,
     files: FilesState,
@@ -179,6 +184,8 @@ impl Default for State {
             // history: Vec::new(),
             temp: Vec::new(),
             files_mode: FilesMode::Normal,
+            new_folder_name: String::new(),
+
             image_gen_ip: false,
             cache: FastHashMap::default(),
             files: FilesState::new("."),
@@ -226,10 +233,11 @@ impl State {
         let mut reader = ImageReader::new(Cursor::new(&buf));
         reader.set_format(image::ImageFormat::Png);
         if let Ok(im) = reader.decode() {
+            let dim = im.dimensions();
             let resized = image::imageops::resize(
                 &im.to_rgba8(),
-                64,
-                64,
+                dim.0 / 16,
+                dim.1 / 16,
                 image::imageops::FilterType::Nearest,
             );
             let dims = resized.dimensions();
@@ -245,8 +253,11 @@ impl State {
             let new_name = ui.rename.clone();
 
             let mut new_options = ui.options.options().to_vec();
-            new_options.remove(new_options.iter().position(|s| s == old_name).unwrap());
-            new_options.push(new_name.clone());
+            let pos = new_options
+                .iter()
+                .position(|s| s == old_name)
+                .unwrap_or_default();
+            new_options.splice(pos..pos + 1, [new_name.clone()]);
             ui.options = combo_box::State::new(new_options);
 
             let old_val = ui.map.remove(old_name);
@@ -302,14 +313,18 @@ pub enum Message {
     ImportPrompt(u64, String, Vec<String>),
     Delete,
     MoveBatch,
-    FilesMode(FilesMode),
+    FilesPaneMode(FilesMode),
     SelectEntry,
+    CreateFolder,
+    FolderName(String),
 
     BasePromptSelected(String),
     CharacterPromptSelected(String),
     TemplateSelected(String),
-    SavePrompt,
+    StorePrompt,
     SavedPrompt(Result<(), SqliteError>),
+    UpdatePrompt(PromptKind),
+    DeletePrompt(PromptKind),
     EditRenameBasePrompt(String),
     EditRenameCharacterPrompt(String),
     EditRenameTemplate(String),
@@ -562,19 +577,25 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
             state.files.visible.clear();
             init_visible(&state.files.entries, &mut state.files.visible, 0, vec![]);
         }
-        FilesMode(mode) => {
+        FilesPaneMode(mode) => {
             state.files_mode = mode;
 
-            for (path, _) in &state.temp {
-                if let Some(entry) = selected_entry_mut(&mut state.files.entries, &path) {
-                    if let Some(children) = &mut entry.children {
-                        for c in children {
-                            c.clear_selected();
+            if mode == FilesMode::Normal {
+                state.files.clear_create_folder();
+                for (path, _) in &state.temp {
+                    if let Some(entry) = selected_entry_mut(&mut state.files.entries, &path) {
+                        if let Some(children) = &mut entry.children {
+                            for c in children {
+                                c.clear_selected();
+                            }
+                        } else {
+                            entry.clear_selected();
                         }
-                    } else {
-                        entry.clear_selected();
                     }
                 }
+            }
+            if mode == FilesMode::CreateFolder {
+                state.files.set_create_folder();
             }
         }
         SelectEntry => {
@@ -587,6 +608,60 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 ));
             }
         }
+        CreateFolder => {
+            state.files.clear_create_folder();
+            if state.new_folder_name.is_empty() {
+                return Task::done(Message::SetMessage("need non-empty folder name".into()));
+            }
+
+            let new_path = PathBuf::from(&state.new_folder_name);
+            if let Err(e) = fs::create_dir(&new_path) {
+                return Task::done(Message::SetMessage(format!("failed to create dir: {}", e)));
+            }
+            let new_entry = Entry {
+                path: new_path,
+                kind: EntryKind::Folder,
+                flags: 0,
+                children: Some(vec![]),
+            };
+            let selected_path_len = state.files.selected.len();
+
+            if let Some(entry) = selected_entry_mut(&mut state.files.entries, &state.files.selected)
+            {
+                match entry.kind {
+                    EntryKind::File => {
+                        if selected_path_len == 1 {
+                            state.files.entries.push(new_entry);
+                        } else {
+                            let selected_parent = &state.files.selected[..selected_path_len - 1];
+                            if let Some(entry) =
+                                selected_entry_mut(&mut state.files.entries, selected_parent)
+                            {
+                                entry
+                                    .children
+                                    .as_mut()
+                                    .expect("parent of file is not a directory")
+                                    .push(new_entry);
+                                entry.children.as_mut().unwrap().sort();
+                            }
+                        }
+                    }
+                    EntryKind::Folder => {
+                        if let Some(children) = &mut entry.children {
+                            children.push(new_entry);
+                            children.sort();
+                        }
+                    }
+                }
+                if selected_path_len == 1 {
+                    init_visible(&state.files.entries, &mut state.files.visible, 0, vec![]);
+                } else {
+                    update_visible(&mut state.files);
+                }
+            }
+            return Task::done(Message::SetMessage("created dir".into()));
+        }
+        FolderName(s) => state.new_folder_name = s,
 
         // prompt storage
         BasePromptSelected(s) => {
@@ -638,7 +713,7 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 }
             }
         }
-        SavePrompt => {
+        StorePrompt => {
             let base = state.base_prompt.text().replace("\n", " ");
 
             let mut characters = Vec::with_capacity(6);
@@ -667,16 +742,68 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 return Task::done(Message::SetMessage("saved prompt".into()));
             };
         }
+        UpdatePrompt(kind) => {
+            let (name, content) = match kind {
+                PromptKind::Base => {
+                    let selected = &state.base.selected;
+                    let contents = state.base_prompt.text().replace("\n", "");
+                    (selected, contents)
+                }
+                PromptKind::Character => {
+                    let selected = &state.char.selected;
+                    let contents = state.character_prompts[state.curr_char]
+                        .content
+                        .text()
+                        .replace("\n", "");
+                    (selected, contents)
+                }
+                _ => unreachable!(),
+            };
+            let task = name.clone().map_or(
+                Task::done(Message::SetMessage("select a prompt to update".into())),
+                |name| {
+                    let pool = state.pool.clone();
+                    Task::perform(
+                        async move { update_prompt(pool, kind, name, content).await },
+                        |r| Message::SavedPrompt(r),
+                    )
+                },
+            );
+            return task;
+        }
+        DeletePrompt(kind) => {
+            let name = match kind {
+                PromptKind::Base => &state.base.selected,
+                PromptKind::Character => &state.char.selected,
+                PromptKind::Template => &state.template.selected,
+            };
+            let task = name.clone().map_or(
+                Task::done(Message::SetMessage("select a prompt to delete".into())),
+                |name| {
+                    let pool = state.pool.clone();
+                    Task::perform(async move { delete_prompt(pool, kind, name).await }, |r| {
+                        Message::SavedPrompt(r)
+                    })
+                },
+            );
+            return task;
+        }
         SubmitRenameBasePrompt => {
             let msg = State::rename_prompt(&mut state.base, state.pool.clone());
+            state.base.rename.clear();
+            state.base.selected = None;
             return Task::done(Message::SetMessage(msg));
         }
         SubmitRenameCharacterPrompt => {
             let msg = State::rename_prompt(&mut state.char, state.pool.clone());
+            state.char.rename.clear();
+            state.char.selected = None;
             return Task::done(Message::SetMessage(msg));
         }
         SubmitRenameTemplate => {
             let msg = State::rename_prompt(&mut state.template, state.pool.clone());
+            state.template.rename.clear();
+            state.template.selected = None;
             return Task::done(Message::SetMessage(msg));
         }
         EditRenameBasePrompt(s) => {
@@ -725,71 +852,6 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
         }
     }
     Task::none()
-}
-
-fn setup_request(state: &mut State) -> ImageGenRequest {
-    let mut req = ImageGenRequest::default();
-
-    req.prompt(state.base_prompt.text());
-
-    let new_seed = state.rng.random_range(1e9..9e9) as u64;
-    req.seed(state.current_seed.unwrap_or(new_seed));
-    state.previous_seed = new_seed;
-    state.current_seed = None;
-
-    req.height_width(state.image_shape);
-
-    for cc in &mut state.character_prompts {
-        if cc.content.text() == "\n" {
-            continue;
-        }
-        cc.c.prompt(cc.content.text());
-        req.add_character(&cc.c);
-    }
-
-    if state
-        .character_prompts
-        .iter()
-        .any(|ch| ch.c.get_center() == Point { x: 0.5, y: 0.5 })
-    {
-        req.use_coords(true);
-    } else {
-        req.use_coords(false);
-    }
-    req
-}
-
-async fn generate_many(
-    semaphore: Arc<Semaphore>,
-    r: Arc<Requester>,
-    req: ImageGenRequest,
-    seeds: Vec<u64>,
-) -> Vec<Result<(Bytes, PathBuf), ImageGenerationError>> {
-    let mut jhs = Vec::new();
-    for seed in seeds {
-        let semaphore = semaphore.clone();
-        let r = r.clone();
-
-        let mut req = req.clone();
-        req.seed(seed);
-
-        let jh = tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
-            let resp = r.generate_image(req).await;
-            drop(_permit);
-            resp
-        });
-        jhs.push(jh);
-
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-    }
-
-    let mut ret = Vec::new();
-    for jh in jhs {
-        let resp = jh.await.unwrap();
-        ret.push(resp);
-    }
-    ret
 }
 
 fn handle_event(state: &mut State, e: Event) -> Task<Message> {
@@ -846,14 +908,16 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
 
             match state.files_mode {
                 FilesMode::Normal => match e {
-                    keyboard::Event::KeyPressed { ref key, .. } => match key.as_ref() {
-                        Key::Named(Named::Backspace) => {
+                    keyboard::Event::KeyPressed {
+                        ref key, modifiers, ..
+                    } => {
+                        if key.as_ref() == Key::Named(Named::Backspace) {
                             return Task::done(Message::NavigateUp);
                         }
-                        Key::Character(".") => {
+                        if key.as_ref() == Key::Character(".") {
                             return Task::done(Message::SetRoot);
                         }
-                        Key::Character("i") => {
+                        if key.as_ref() == Key::Character("i") {
                             if let Some(entry) =
                                 selected_entry(&state.files.entries, &state.files.selected)
                             {
@@ -873,27 +937,22 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
                                 }
                             }
                         }
-                        Key::Character("d") => {
+                        if key.as_ref() == Key::Character("d") {
                             return Task::done(Message::Delete);
                         }
-                        Key::Character("b") => {
-                            return Task::done(Message::FilesMode(FilesMode::Batch));
+                        if key.as_ref() == Key::Character("b") {
+                            return Task::done(Message::FilesPaneMode(FilesMode::Batch));
                         }
-                        _ => (),
-                    },
+                        if key.as_ref() == Key::Character("a") && modifiers.shift() {
+                            return Task::done(Message::FilesPaneMode(FilesMode::CreateFolder));
+                        }
+                    }
                     _ => (),
                 },
                 FilesMode::Batch => match e {
-                    keyboard::Event::KeyPressed {
-                        ref key,
-                        modifiers: _,
-                        ..
-                    } => match key.as_ref() {
+                    keyboard::Event::KeyPressed { ref key, .. } => match key.as_ref() {
                         Key::Character("s") => {
                             return Task::done(Message::SelectEntry);
-                        }
-                        Key::Named(Named::Escape) => {
-                            return Task::done(Message::FilesMode(FilesMode::Normal));
                         }
                         Key::Character("m") => {
                             return Task::done(Message::MoveBatch);
@@ -902,10 +961,14 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
                     },
                     _ => (),
                 },
+                _ => (),
             }
 
             match e {
                 keyboard::Event::KeyPressed { key, modifiers, .. } => match key.as_ref() {
+                    Key::Named(Named::Escape) => {
+                        return Task::done(Message::FilesPaneMode(FilesMode::Normal));
+                    }
                     Key::Named(Named::ArrowUp) | Key::Character("k") => {
                         if let Some(i) = current_index {
                             if i > 0 {
@@ -1047,7 +1110,7 @@ fn view_files(state: &State) -> Element<Message> {
     let end = (state.files.view_offset + MAX_VISIBLE).min(state.files.visible.len());
     let slice = &state.files.visible[state.files.view_offset..end];
 
-    let col = slice
+    let mut col = slice
         .iter()
         .enumerate()
         .fold(Column::new(), |col, (_i, e)| {
@@ -1084,6 +1147,16 @@ fn view_files(state: &State) -> Element<Message> {
             col.push(text(label).style(style))
         });
 
+    col = col.push_maybe(if state.files.create_folder() {
+        Some(
+            text_input("new folder name", &state.new_folder_name)
+                .on_input(Message::FolderName)
+                .on_submit(Message::CreateFolder),
+        )
+    } else {
+        None
+    });
+
     let mode = text(state.files_mode.to_string());
 
     scrollable(column![col, mode]).into()
@@ -1096,30 +1169,25 @@ fn view_prompts(state: &State) -> Element<Message> {
         state.base.selected.as_ref(),
         Message::BasePromptSelected,
     );
-
     let char_select = combo_box(
         &state.char.options,
         "character",
         state.char.selected.as_ref(),
         Message::CharacterPromptSelected,
     );
-
     let template_select = combo_box(
         &state.template.options,
         "template",
         state.template.selected.as_ref(),
         Message::TemplateSelected,
     );
-
     let char_dropdown = pick_list(
         [1, 2, 3, 4, 5, 6],
         Some(state.curr_char + 1),
         Message::CharSelected,
     );
-
     let select_prompt = row![char_dropdown, base_select, char_select, template_select];
 
-    let save_prompt = button(text("Save Prompt")).on_press(Message::SavePrompt);
     let base_rename = text_input("rename base_prompt", &state.base.rename)
         .on_input(Message::EditRenameBasePrompt)
         .on_submit(Message::SubmitRenameBasePrompt);
@@ -1129,8 +1197,28 @@ fn view_prompts(state: &State) -> Element<Message> {
     let template_rename = text_input("rename template", &state.template.rename)
         .on_input(Message::EditRenameTemplate)
         .on_submit(Message::SubmitRenameTemplate);
-    let save_rename =
-        row![save_prompt, base_rename, char_rename, template_rename].align_y(Alignment::Center);
+    let rename = row![base_rename, char_rename, template_rename].align_y(Alignment::Center);
+
+    let save_prompt = button(text("Save New")).on_press(Message::StorePrompt);
+    let update_base = button(text("Base Prompt")).on_press(Message::UpdatePrompt(PromptKind::Base));
+    let update_char =
+        button(text("Character")).on_press(Message::UpdatePrompt(PromptKind::Character));
+    let update_template =
+        button(text("Template")).on_press(Message::UpdatePrompt(PromptKind::Template));
+    let delete_base = button(text("Base Prompt")).on_press(Message::DeletePrompt(PromptKind::Base));
+    let delete_char =
+        button(text("Character")).on_press(Message::DeletePrompt(PromptKind::Character));
+    let delete_template =
+        button(text("Template")).on_press(Message::DeletePrompt(PromptKind::Template));
+    let crud_prompt = column![
+        row![save_prompt].align_y(Alignment::Center),
+        row![text("Update"), update_base, update_char, update_template]
+            .align_y(Alignment::Center)
+            .spacing(4),
+        row![text("Delete"), delete_base, delete_char, delete_template]
+            .align_y(Alignment::Center)
+            .spacing(4),
+    ];
 
     let mut text_areas = Column::with_capacity(7).spacing(10);
     text_areas = text_areas.push(
@@ -1188,7 +1276,7 @@ fn view_prompts(state: &State) -> Element<Message> {
     let current_seed = text(state.current_seed.unwrap_or_default());
     let copy_seed = button(text("Use Previous Seed")).on_press(Message::CopySeed);
     let clear_seed = button(text("Clear Seed")).on_press(Message::ClearSeed);
-    let seed = row![text("Seed: "), current_seed, copy_seed, clear_seed];
+    let seed = row![text("Seed: "), current_seed, copy_seed, clear_seed].align_y(Alignment::Center);
 
     let orientation = pick_list(
         [
@@ -1202,12 +1290,15 @@ fn view_prompts(state: &State) -> Element<Message> {
 
     let mut content = Column::with_children([
         select_prompt.into(),
-        save_rename.into(),
+        rename.into(),
+        crud_prompt.into(),
         text_areas.into(),
         position_grid.into(),
         seed.into(),
         orientation.into(),
-    ]);
+    ])
+    .padding(2)
+    .spacing(4);
 
     content = content.push_maybe(if !state.image_gen_ip && state.base_prompt.text() != "\n" {
         Some(column![
@@ -1293,6 +1384,71 @@ fn view_controls<'a>(pane: pane_grid::Pane, is_maximized: bool) -> Element<'a, M
     .spacing(5);
 
     row.into()
+}
+
+fn setup_request(state: &mut State) -> ImageGenRequest {
+    let mut req = ImageGenRequest::default();
+
+    req.prompt(state.base_prompt.text());
+
+    let new_seed = state.rng.random_range(1e9..9e9) as u64;
+    req.seed(state.current_seed.unwrap_or(new_seed));
+    state.previous_seed = new_seed;
+    state.current_seed = None;
+
+    req.height_width(state.image_shape);
+
+    for cc in &mut state.character_prompts {
+        if cc.content.text() == "\n" {
+            continue;
+        }
+        cc.c.prompt(cc.content.text());
+        req.add_character(&cc.c);
+    }
+
+    if state
+        .character_prompts
+        .iter()
+        .any(|ch| ch.c.get_center() == Point { x: 0.5, y: 0.5 })
+    {
+        req.use_coords(true);
+    } else {
+        req.use_coords(false);
+    }
+    req
+}
+
+async fn generate_many(
+    semaphore: Arc<Semaphore>,
+    r: Arc<Requester>,
+    req: ImageGenRequest,
+    seeds: Vec<u64>,
+) -> Vec<Result<(Bytes, PathBuf), ImageGenerationError>> {
+    let mut jhs = Vec::new();
+    for seed in seeds {
+        let semaphore = semaphore.clone();
+        let r = r.clone();
+
+        let mut req = req.clone();
+        req.seed(seed);
+
+        let jh = tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
+            let resp = r.generate_image(req).await;
+            drop(_permit);
+            resp
+        });
+        jhs.push(jh);
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    }
+
+    let mut ret = Vec::new();
+    for jh in jhs {
+        let resp = jh.await.unwrap();
+        ret.push(resp);
+    }
+    ret
 }
 
 fn delete_file(state: &mut State) -> Task<Message> {
@@ -1419,6 +1575,7 @@ pub enum FilesMode {
     #[default]
     Normal,
     Batch,
+    CreateFolder,
 }
 
 impl Display for FilesMode {
@@ -1427,6 +1584,7 @@ impl Display for FilesMode {
         match self {
             Normal => write!(f, "Normal"),
             Batch => write!(f, "Batch"),
+            CreateFolder => write!(f, "CreateFolder"),
         }
     }
 }
