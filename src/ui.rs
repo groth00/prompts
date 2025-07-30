@@ -11,7 +11,7 @@ use std::{
 
 use bytes::Bytes;
 use iced::{
-    Element, Event,
+    Alignment, Element, Event,
     Length::{self},
     Subscription, Task, event,
     keyboard::{
@@ -19,13 +19,13 @@ use iced::{
         key::{Key, Named},
     },
     widget::{
-        Column, Image, PaneGrid, button, center, column, combo_box, container,
+        self, Column, Image, PaneGrid, button, center, column, combo_box, container,
         image::Handle,
         mouse_area,
         pane_grid::{self, Axis, Configuration, Direction},
         pick_list, row, scrollable,
         shader::wgpu::naga::FastHashMap,
-        text, text_editor,
+        text,
         text_editor::{Action, Edit},
         text_input,
     },
@@ -34,8 +34,9 @@ use iced::{
 use image::ImageReader;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rand::{Rng, rngs::ThreadRng};
+use rand::{Rng, distr::Uniform, rngs::ThreadRng};
 use serde_json::{Map, Value};
+use tokio::sync::Semaphore;
 use zip::ZipArchive;
 
 use crate::{
@@ -45,49 +46,36 @@ use crate::{
         update_visible,
     },
     image_metadata::extract_image_metadata,
-    nai::{self, ImageGenRequest, ImageGenerationError, Point, Position, Requester},
+    nai::{self, ImageGenRequest, ImageGenerationError, ImageShape, Point, Position, Requester},
 };
 
-const FILE_EXTENSIONS: [&'static str; 7] = ["avif", "gif", "jpeg", "jpg", "qoi", "png", "webp"];
+const FILE_EXTENSIONS: [&'static str; 3] = ["jpeg", "jpg", "png"];
 const MAX_VISIBLE: usize = 40;
 
 pub struct State {
+    semaphore: Arc<Semaphore>,
     message: Option<String>,
     panes: pane_grid::State<Pane>,
     focus: Option<pane_grid::Pane>,
 
     rng: ThreadRng,
 
-    base_prompt: text_editor::Content,
-    c1: CharacterContent,
-    c2: CharacterContent,
-    c3: CharacterContent,
-    c4: CharacterContent,
-    c5: CharacterContent,
-    c6: CharacterContent,
-    curr_char: CharacterNum,
+    base_prompt: widget::text_editor::Content,
+    character_prompts: [CharacterContent; 6],
+    curr_char: usize,
+    image_shape: ImageShape,
 
     pool: Pool<SqliteConnectionManager>,
 
-    base_options: combo_box::State<String>,
-    base_map: FastHashMap<String, String>,
-    base_selected: Option<String>,
-    base_rename: String,
-
-    char_options: combo_box::State<String>,
-    char_map: FastHashMap<String, String>,
-    char_selected: Option<String>,
-    char_rename: String,
-
-    template_options: combo_box::State<String>,
-    template_map: FastHashMap<String, Template>,
-    template_selected: Option<String>,
-    template_rename: String,
+    base: PromptUi<String>,
+    char: PromptUi<String>,
+    template: PromptUi<Template>,
 
     previous_seed: u64,
     current_seed: Option<u64>,
+    num_generate_temp: String,
+    num_generate: u8,
 
-    // history: Vec<PromptHistoryEntry>,
     temp: Vec<(Vec<usize>, PathBuf)>,
     files_mode: FilesMode,
     image_gen_ip: bool,
@@ -97,6 +85,8 @@ pub struct State {
     images: VecDeque<Vec<u8>>,
     selected_image: Option<usize>,
     thumbnails: VecDeque<Handle>,
+    image_paths: VecDeque<PathBuf>,
+    trash: PathBuf,
 }
 
 impl Default for State {
@@ -107,6 +97,15 @@ impl Default for State {
 
         let (base_options, base_map, char_options, char_map, template_options, template_map) =
             fetch_prompts(pool.clone()).expect("fetch_prompts");
+
+        let character_prompts = [
+            CharacterContent::new(),
+            CharacterContent::new(),
+            CharacterContent::new(),
+            CharacterContent::new(),
+            CharacterContent::new(),
+            CharacterContent::new(),
+        ];
 
         let files_pane = Pane::new(PaneId::Files);
         let prompts_pane = Pane::new(PaneId::Prompts);
@@ -124,41 +123,58 @@ impl Default for State {
             b: Box::new(Configuration::Pane(image_pane)),
         });
 
+        let trash = if let Some(home) = std::env::home_dir() {
+            home.join(".Trash")
+        } else if let Err(_e) = fs::exists("trash") {
+            fs::create_dir("trash").expect("create trash dir");
+            PathBuf::from("trash")
+        } else {
+            PathBuf::from("trash")
+        };
+
         let state = Self {
+            semaphore: Arc::new(Semaphore::new(1)),
             message: None,
             panes,
             focus: None,
 
             rng: rand::rng(),
 
-            base_prompt: text_editor::Content::new(),
-            c1: CharacterContent::new(),
-            c2: CharacterContent::new(),
-            c3: CharacterContent::new(),
-            c4: CharacterContent::new(),
-            c5: CharacterContent::new(),
-            c6: CharacterContent::new(),
-            curr_char: CharacterNum::Char1,
+            base_prompt: widget::text_editor::Content::new(),
+            character_prompts,
+            curr_char: 0,
+            image_shape: ImageShape::Portrait,
 
             pool,
 
-            base_options: combo_box::State::new(base_options),
-            base_map,
-            base_selected: None,
-            base_rename: String::new(),
+            base: PromptUi {
+                kind: PromptKind::Base,
+                options: combo_box::State::new(base_options),
+                map: base_map,
+                selected: None,
+                rename: String::new(),
+            },
 
-            char_options: combo_box::State::new(char_options),
-            char_map,
-            char_selected: None,
-            char_rename: String::new(),
+            char: PromptUi {
+                kind: PromptKind::Character,
+                options: combo_box::State::new(char_options),
+                map: char_map,
+                selected: None,
+                rename: String::new(),
+            },
 
-            template_options: combo_box::State::new(template_options),
-            template_map,
-            template_selected: None,
-            template_rename: String::new(),
+            template: PromptUi {
+                kind: PromptKind::Template,
+                options: combo_box::State::new(template_options),
+                map: template_map,
+                selected: None,
+                rename: String::new(),
+            },
 
             previous_seed: 0,
             current_seed: None,
+            num_generate_temp: String::new(),
+            num_generate: 1,
 
             // history: Vec::new(),
             temp: Vec::new(),
@@ -171,6 +187,8 @@ impl Default for State {
             images: VecDeque::new(),
             selected_image: None,
             thumbnails: VecDeque::new(),
+            image_paths: VecDeque::new(),
+            trash,
         };
         state
     }
@@ -181,17 +199,68 @@ impl State {
         let (base_options, base_map, char_options, char_map, template_options, template_map) =
             fetch_prompts(self.pool.clone()).expect("fetch_prompts");
 
-        self.base_options = combo_box::State::new(base_options);
-        self.base_map = base_map;
-        self.base_selected = None;
+        self.base.options = combo_box::State::new(base_options);
+        self.base.map = base_map;
+        self.base.selected = None;
 
-        self.char_options = combo_box::State::new(char_options);
-        self.char_map = char_map;
-        self.char_selected = None;
+        self.char.options = combo_box::State::new(char_options);
+        self.char.map = char_map;
+        self.char.selected = None;
 
-        self.template_options = combo_box::State::new(template_options);
-        self.template_map = template_map;
-        self.template_selected = None;
+        self.template.options = combo_box::State::new(template_options);
+        self.template.map = template_map;
+        self.template.selected = None;
+    }
+
+    /// processes generated images
+    fn insert_image(&mut self, bytes: Bytes, path: PathBuf) {
+        self.message = Some("generated image".into());
+
+        let reader = Cursor::new(bytes);
+        let mut archive = ZipArchive::new(reader).unwrap();
+        let mut file = archive.by_index(0).unwrap();
+
+        let mut buf = Vec::with_capacity(file.size() as usize);
+        std::io::copy(&mut file, &mut buf).unwrap();
+
+        let mut reader = ImageReader::new(Cursor::new(&buf));
+        reader.set_format(image::ImageFormat::Png);
+        if let Ok(im) = reader.decode() {
+            let resized = image::imageops::resize(
+                &im.to_rgba8(),
+                64,
+                64,
+                image::imageops::FilterType::Nearest,
+            );
+            let dims = resized.dimensions();
+            let thumb_handle = Handle::from_rgba(dims.0, dims.1, resized.into_raw());
+            self.thumbnails.push_front(thumb_handle);
+            self.images.push_front(buf);
+            self.image_paths.push_front(path);
+        }
+    }
+
+    fn rename_prompt<V>(ui: &mut PromptUi<V>, pool: Pool<SqliteConnectionManager>) -> String {
+        if let Some(old_name) = &ui.selected {
+            let new_name = ui.rename.clone();
+
+            let mut new_options = ui.options.options().to_vec();
+            new_options.remove(new_options.iter().position(|s| s == old_name).unwrap());
+            new_options.push(new_name.clone());
+            ui.options = combo_box::State::new(new_options);
+
+            let old_val = ui.map.remove(old_name);
+            ui.map.insert(new_name.clone(), old_val.unwrap());
+
+            let r = update_prompt_name(pool.clone(), ui.kind, old_name.clone(), new_name);
+            let message = if let Err(e) = r {
+                e.to_string()
+            } else {
+                String::from("rename successful")
+            };
+            return message;
+        }
+        String::from("rename failed")
     }
 }
 
@@ -199,36 +268,43 @@ impl State {
 pub enum Message {
     Event(Event),
     SetMessage(String),
+
     FocusAdjacent(pane_grid::Direction),
     Clicked(pane_grid::Pane),
     Dragged(pane_grid::DragEvent),
     Resized(pane_grid::ResizeEvent),
     Maximize(pane_grid::Pane),
     Restore,
-    EditBasePrompt(text_editor::Action),
-    EditChar1(text_editor::Action),
-    EditChar2(text_editor::Action),
-    EditChar3(text_editor::Action),
-    EditChar4(text_editor::Action),
-    EditChar5(text_editor::Action),
-    EditChar6(text_editor::Action),
-    ImageGenerated(Result<(Bytes, String), ImageGenerationError>),
-    CharSelected(CharacterNum),
+
+    EditBasePrompt(widget::text_editor::Action),
+    EditCharPrompt((usize, widget::text_editor::Action)),
+    CharSelected(usize),
     SetPosition(Position),
-    SubmitRequest,
+
+    CopySeed,
+    ClearSeed,
+    EditNumGenerate(String),
+    NumGenerate,
+    ImageShape(ImageShape),
+    GenerateOne,
+    GenerateMany,
+    ImageGenerated(Result<(Bytes, PathBuf), ImageGenerationError>),
+    ImagesGenerated(Vec<Result<(Bytes, PathBuf), ImageGenerationError>>),
+
+    Entries((Vec<usize>, Vec<Entry>)),
     ToggleExpand(Vec<usize>),
     Refresh,
     RefreshSelected,
-    Entries((Vec<usize>, Vec<Entry>)),
     GotoStart,
     GotoEnd,
     NavigateUp,
     SetRoot,
-    ImportPrompt(String, Vec<String>),
+    ImportPrompt(u64, String, Vec<String>),
     Delete,
     MoveBatch,
     FilesMode(FilesMode),
     SelectEntry,
+
     BasePromptSelected(String),
     CharacterPromptSelected(String),
     TemplateSelected(String),
@@ -240,25 +316,19 @@ pub enum Message {
     SubmitRenameBasePrompt,
     SubmitRenameCharacterPrompt,
     SubmitRenameTemplate,
-    CopySeed,
-    ClearSeed,
+
     ImageClicked(usize),
     MetadataFromImage(usize),
+    DeleteImageHistory,
 }
 
 pub fn update(state: &mut State, msg: Message) -> Task<Message> {
     use Message::*;
     match msg {
-        Entries((path, mut entries)) => {
-            if let Some(entry) = selected_entry_mut(&mut state.files.entries, &path) {
-                entries.sort();
-                entry.children = Some(entries);
-                entry.set_expanded();
-            }
-            update_visible(&mut state.files);
-        }
         Event(e) => return handle_event(state, e),
         SetMessage(s) => state.message = Some(s),
+
+        // pane
         FocusAdjacent(direction) => {
             if let Some(pane) = state.focus {
                 if let Some(adjacent) = state.panes.adjacent(pane, direction) {
@@ -278,112 +348,100 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
         }
         Maximize(pane) => state.panes.maximize(pane),
         Restore => state.panes.restore(),
+
+        // prompt edit
         EditBasePrompt(action) => state.base_prompt.perform(action),
-        EditChar1(action) => state.c1.content.perform(action),
-        EditChar2(action) => state.c2.content.perform(action),
-        EditChar3(action) => state.c3.content.perform(action),
-        EditChar4(action) => state.c4.content.perform(action),
-        EditChar5(action) => state.c5.content.perform(action),
-        EditChar6(action) => state.c6.content.perform(action),
-        CharSelected(c) => {
-            state.curr_char = c;
-            return Task::done(Message::SetMessage(format!("set curr_char to {}", c)));
+        EditCharPrompt((i, action)) => state.character_prompts[i].content.perform(action),
+        CharSelected(index) => {
+            state.curr_char = index - 1;
+            return Task::done(Message::SetMessage(format!(
+                "set curr_char to {}",
+                index - 1
+            )));
         }
         SetPosition(p) => {
-            match state.curr_char {
-                CharacterNum::Char1 => state.c1.c.center(p),
-                CharacterNum::Char2 => state.c2.c.center(p),
-                CharacterNum::Char3 => state.c3.c.center(p),
-                CharacterNum::Char4 => state.c4.c.center(p),
-                CharacterNum::Char5 => state.c5.c.center(p),
-                CharacterNum::Char6 => state.c6.c.center(p),
-            };
+            state.character_prompts[state.curr_char].c.center(p);
             return Task::done(Message::SetMessage(format!(
                 "set curr_position of {} to {:?}",
                 state.curr_char, p
             )));
         }
-        SubmitRequest => {
+
+        // image generation
+        ClearSeed => state.current_seed = None,
+        CopySeed => state.current_seed = Some(state.previous_seed),
+        ImageShape(shape) => {
+            state.image_shape = shape;
+        }
+        EditNumGenerate(s) => state.num_generate_temp = s,
+        NumGenerate => match state.num_generate_temp.parse::<u8>() {
+            Ok(num) => {
+                state.num_generate = num;
+                return Task::done(Message::SetMessage("set num_generate".into()));
+            }
+            Err(e) => return Task::done(Message::SetMessage(e.to_string())),
+        },
+        GenerateOne => {
             state.image_gen_ip = true;
 
-            let mut req = ImageGenRequest::default();
-            req.prompt(state.base_prompt.text());
-            let new_seed = state.rng.random_range(1e9..9e9) as u64;
-            req.seed(state.current_seed.unwrap_or(new_seed));
-            state.previous_seed = new_seed;
-            state.current_seed = None;
-
-            for c in [
-                &mut state.c1,
-                &mut state.c2,
-                &mut state.c3,
-                &mut state.c4,
-                &mut state.c5,
-                &mut state.c6,
-            ]
-            .iter_mut()
-            {
-                if c.content.text() == "\n" {
-                    continue;
-                }
-                c.c.prompt(c.content.text());
-                req.add_character(&c.c);
-            }
-
-            if [
-                state.c1.c.get_center(),
-                state.c2.c.get_center(),
-                state.c3.c.get_center(),
-                state.c4.c.get_center(),
-                state.c5.c.get_center(),
-                state.c6.c.get_center(),
-            ]
-            .iter()
-            .any(|p| *p == Point { x: 0.5, y: 0.5 })
-            {
-                req.use_coords(true);
-            }
-
+            let req = setup_request(state);
             let r = Arc::clone(&state.client);
 
-            return Task::perform(
-                async move {
-                    r.generate_image(crate::nai::ImageShape::Portrait, req)
-                        .await
-                },
-                |r| Message::ImageGenerated(r),
-            );
+            return Task::perform(async move { r.generate_image(req).await }, |r| {
+                Message::ImageGenerated(r)
+            });
+        }
+        GenerateMany => {
+            state.image_gen_ip = true;
+
+            let req = setup_request(state);
+            let num_generate = state.num_generate;
+            let semaphore = Arc::clone(&state.semaphore);
+            let client = Arc::clone(&state.client);
+
+            let between = Uniform::new(1e8 as u64, 9e9 as u64).unwrap();
+            let seeds: Vec<u64> = (&mut state.rng)
+                .sample_iter(between)
+                .take(num_generate as usize)
+                .collect();
+
+            return Task::perform(generate_many(semaphore, client, req, seeds), |results| {
+                Message::ImagesGenerated(results)
+            });
         }
         ImageGenerated(res) => {
             state.image_gen_ip = false;
+
             match res {
                 Err(e) => state.message = Some(e.to_string()),
                 Ok((bytes, path)) => {
-                    state.message = Some(path);
+                    state.message = Some("generated image".into());
+                    state.insert_image(bytes, path);
+                }
+            }
+        }
+        ImagesGenerated(results) => {
+            state.image_gen_ip = false;
 
-                    let reader = Cursor::new(bytes);
-                    let mut archive = ZipArchive::new(reader).unwrap();
-                    let mut file = archive.by_index(0).unwrap();
-
-                    let mut buf = Vec::with_capacity(file.size() as usize);
-                    std::io::copy(&mut file, &mut buf).unwrap();
-
-                    let mut reader = ImageReader::new(Cursor::new(&buf));
-                    reader.set_format(image::ImageFormat::Png);
-                    if let Ok(im) = reader.decode() {
-                        let resized = image::imageops::resize(
-                            &im.to_rgba8(),
-                            64,
-                            64,
-                            image::imageops::FilterType::Nearest,
-                        );
-                        let dims = resized.dimensions();
-                        let thumb_handle = Handle::from_rgba(dims.0, dims.1, resized.into_raw());
-                        state.thumbnails.push_front(thumb_handle);
-                        state.images.push_front(buf);
+            for r in results {
+                match r {
+                    Err(e) => state.message = Some(e.to_string()),
+                    Ok((bytes, path)) => {
+                        state.message = Some("generated image".into());
+                        state.insert_image(bytes, path);
                     }
                 }
             }
+        }
+
+        // files
+        Entries((path, mut entries)) => {
+            if let Some(entry) = selected_entry_mut(&mut state.files.entries, &path) {
+                entries.sort();
+                entry.children = Some(entries);
+                entry.set_expanded();
+            }
+            update_visible(&mut state.files);
         }
         ToggleExpand(path) => {
             if let Some(entry) = selected_entry_mut(&mut state.files.entries, &path) {
@@ -455,7 +513,10 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 }
             }
         }
-        ImportPrompt(base, characters) => set_prompt_characters(state, base, characters),
+        ImportPrompt(seed, base, characters) => {
+            set_prompt_characters(state, base, characters);
+            state.current_seed = Some(seed);
+        }
         Delete => return delete_file(state),
         MoveBatch => {
             if state.files.selected.len() == 1 {
@@ -526,9 +587,11 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 ));
             }
         }
+
+        // prompt storage
         BasePromptSelected(s) => {
-            if let Some(prompt) = state.base_map.get(&s) {
-                state.base_selected = Some(s);
+            if let Some(prompt) = state.base.map.get(&s) {
+                state.base.selected = Some(s);
                 state.base_prompt.perform(Action::SelectAll);
                 state.base_prompt.perform(Action::Edit(Edit::Delete));
                 state
@@ -537,63 +600,23 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
             }
         }
         CharacterPromptSelected(s) => {
-            if let Some(prompt) = state.char_map.get(&s) {
-                state.char_selected = Some(s);
-                match state.curr_char {
-                    CharacterNum::Char1 => {
-                        state.c1.content.perform(Action::SelectAll);
-                        state.c1.content.perform(Action::Edit(Edit::Delete));
-                        state
-                            .c1
-                            .content
-                            .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
-                    }
-                    CharacterNum::Char2 => {
-                        state.c2.content.perform(Action::SelectAll);
-                        state.c2.content.perform(Action::Edit(Edit::Delete));
-                        state
-                            .c2
-                            .content
-                            .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
-                    }
-                    CharacterNum::Char3 => {
-                        state.c3.content.perform(Action::SelectAll);
-                        state.c3.content.perform(Action::Edit(Edit::Delete));
-                        state
-                            .c3
-                            .content
-                            .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
-                    }
-                    CharacterNum::Char4 => {
-                        state.c4.content.perform(Action::SelectAll);
-                        state.c4.content.perform(Action::Edit(Edit::Delete));
-                        state
-                            .c4
-                            .content
-                            .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
-                    }
-                    CharacterNum::Char5 => {
-                        state.c5.content.perform(Action::SelectAll);
-                        state.c5.content.perform(Action::Edit(Edit::Delete));
-                        state
-                            .c5
-                            .content
-                            .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
-                    }
-                    CharacterNum::Char6 => {
-                        state.c6.content.perform(Action::SelectAll);
-                        state.c6.content.perform(Action::Edit(Edit::Delete));
-                        state
-                            .c6
-                            .content
-                            .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
-                    }
-                }
+            if let Some(prompt) = state.char.map.get(&s) {
+                state.char.selected = Some(s);
+                let i = state.curr_char;
+                state.character_prompts[i]
+                    .content
+                    .perform(Action::SelectAll);
+                state.character_prompts[i]
+                    .content
+                    .perform(Action::Edit(Edit::Delete));
+                state.character_prompts[i]
+                    .content
+                    .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
             }
         }
         TemplateSelected(s) => {
-            if let Some(template) = state.template_map.get(&s) {
-                state.template_selected = Some(s);
+            if let Some(template) = state.template.map.get(&s) {
+                state.template.selected = Some(s);
 
                 state.base_prompt.perform(Action::SelectAll);
                 state.base_prompt.perform(Action::Edit(Edit::Delete));
@@ -601,53 +624,17 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                     .base_prompt
                     .perform(Action::Edit(Edit::Paste(Arc::new(template.base.clone()))));
 
-                if let Some(c1) = &template.c1 {
-                    state.c1.content.perform(Action::SelectAll);
-                    state.c1.content.perform(Action::Edit(Edit::Delete));
-                    state
-                        .c1
-                        .content
-                        .perform(Action::Edit(Edit::Paste(Arc::new(c1.clone()))));
+                for cc in &mut state.character_prompts {
+                    cc.content.perform(Action::SelectAll);
+                    cc.content.perform(Action::Edit(Edit::Delete));
                 }
-                if let Some(c2) = &template.c2 {
-                    state.c2.content.perform(Action::SelectAll);
-                    state.c2.content.perform(Action::Edit(Edit::Delete));
-                    state
-                        .c2
-                        .content
-                        .perform(Action::Edit(Edit::Paste(Arc::new(c2.clone()))));
-                }
-                if let Some(c3) = &template.c3 {
-                    state.c3.content.perform(Action::SelectAll);
-                    state.c3.content.perform(Action::Edit(Edit::Delete));
-                    state
-                        .c3
-                        .content
-                        .perform(Action::Edit(Edit::Paste(Arc::new(c3.clone()))));
-                }
-                if let Some(c4) = &template.c4 {
-                    state.c4.content.perform(Action::SelectAll);
-                    state.c4.content.perform(Action::Edit(Edit::Delete));
-                    state
-                        .c4
-                        .content
-                        .perform(Action::Edit(Edit::Paste(Arc::new(c4.clone()))));
-                }
-                if let Some(c5) = &template.c5 {
-                    state.c5.content.perform(Action::SelectAll);
-                    state.c5.content.perform(Action::Edit(Edit::Delete));
-                    state
-                        .c5
-                        .content
-                        .perform(Action::Edit(Edit::Paste(Arc::new(c5.clone()))));
-                }
-                if let Some(c6) = &template.c6 {
-                    state.c6.content.perform(Action::SelectAll);
-                    state.c6.content.perform(Action::Edit(Edit::Delete));
-                    state
-                        .c6
-                        .content
-                        .perform(Action::Edit(Edit::Paste(Arc::new(c6.clone()))));
+
+                for (i, ch) in template.characters.iter().enumerate() {
+                    if let Some(prompt) = ch {
+                        state.character_prompts[i]
+                            .content
+                            .perform(Action::Edit(Edit::Paste(Arc::new(prompt.clone()))));
+                    }
                 }
             }
         }
@@ -655,16 +642,10 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
             let base = state.base_prompt.text().replace("\n", " ");
 
             let mut characters = Vec::with_capacity(6);
-            for c in [
-                state.c1.content.text().replace("\n", ""),
-                state.c2.content.text().replace("\n", ""),
-                state.c3.content.text().replace("\n", ""),
-                state.c4.content.text().replace("\n", ""),
-                state.c5.content.text().replace("\n", ""),
-                state.c6.content.text().replace("\n", ""),
-            ] {
-                if !c.is_empty() {
-                    characters.push(c.clone());
+            for cc in &state.character_prompts {
+                let prompt = cc.content.text().replace("\n", "");
+                if !prompt.is_empty() {
+                    characters.push(prompt.into());
                 }
             }
             let now = SystemTime::now()
@@ -687,94 +668,58 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
             };
         }
         SubmitRenameBasePrompt => {
-            if let Some(old_name) = &state.base_selected {
-                let new_name = state.base_rename.clone();
-                let mut new_options = state.base_options.options().to_vec();
-                new_options.remove(new_options.iter().position(|s| s == old_name).unwrap());
-                new_options.push(new_name.clone());
-                state.base_options = combo_box::State::new(new_options);
-
-                let old_val = state.base_map.remove(&old_name.clone());
-                state.base_map.insert(new_name.clone(), old_val.unwrap());
-
-                let r = update_prompt_name(
-                    state.pool.clone(),
-                    PromptKind::Base,
-                    old_name.clone(),
-                    new_name,
-                );
-                let message = if let Err(e) = r {
-                    e.to_string()
-                } else {
-                    "renamed base prompt".into()
-                };
-                return Task::done(Message::SetMessage(message));
-            }
+            let msg = State::rename_prompt(&mut state.base, state.pool.clone());
+            return Task::done(Message::SetMessage(msg));
         }
         SubmitRenameCharacterPrompt => {
-            if let Some(old_name) = &state.char_selected {
-                let new_name = state.char_rename.clone();
-                let mut new_options = state.char_options.options().to_vec();
-                new_options.remove(new_options.iter().position(|s| s == old_name).unwrap());
-                new_options.push(new_name.clone());
-                state.char_options = combo_box::State::new(new_options);
-
-                let old_val = state.char_map.remove(&old_name.clone());
-                state.char_map.insert(new_name.clone(), old_val.unwrap());
-
-                let pool = state.pool.clone();
-                let r = update_prompt_name(pool, PromptKind::Character, old_name.clone(), new_name);
-                let message = if let Err(e) = r {
-                    e.to_string()
-                } else {
-                    "renamed character prompt".into()
-                };
-                return Task::done(Message::SetMessage(message));
-            }
+            let msg = State::rename_prompt(&mut state.char, state.pool.clone());
+            return Task::done(Message::SetMessage(msg));
         }
         SubmitRenameTemplate => {
-            if let Some(old_name) = &state.template_selected {
-                let new_name = state.template_rename.clone();
-                let mut new_options = state.template_options.options().to_vec();
-                new_options.remove(new_options.iter().position(|s| s == old_name).unwrap());
-                new_options.push(new_name.clone());
-                state.template_options = combo_box::State::new(new_options);
-
-                let old_val = state.template_map.remove(&old_name.clone());
-                state
-                    .template_map
-                    .insert(new_name.clone(), old_val.unwrap());
-
-                let pool = state.pool.clone();
-                let r = update_prompt_name(pool, PromptKind::Template, old_name.clone(), new_name);
-                let message = if let Err(e) = r {
-                    e.to_string()
-                } else {
-                    "renamed template".into()
-                };
-                return Task::done(Message::SetMessage(message));
-            }
+            let msg = State::rename_prompt(&mut state.template, state.pool.clone());
+            return Task::done(Message::SetMessage(msg));
         }
         EditRenameBasePrompt(s) => {
-            state.base_rename = s;
+            state.base.rename = s;
         }
         EditRenameCharacterPrompt(s) => {
-            state.char_rename = s;
+            state.char.rename = s;
         }
         EditRenameTemplate(s) => {
-            state.template_rename = s;
+            state.template.rename = s;
         }
-        ClearSeed => state.current_seed = None,
-        CopySeed => state.current_seed = Some(state.previous_seed),
+
+        // image
         ImageClicked(i) => state.selected_image = Some(i),
         MetadataFromImage(i) => {
             if let Some(bytes) = state.images.get(i) {
-                let reader = ImageReader::new(Cursor::new(bytes));
+                let mut reader = ImageReader::new(Cursor::new(bytes));
+                reader.set_format(image::ImageFormat::Png);
                 if let Ok(im) = reader.decode() {
                     if let Ok(metadata) = extract_image_metadata(im) {
-                        let (base, characters) = get_prompt_characters(metadata);
+                        let (seed, base, characters) = get_prompt_characters(metadata);
                         set_prompt_characters(state, base, characters);
+                        state.current_seed = Some(seed);
                     }
+                }
+            }
+        }
+        DeleteImageHistory => {
+            if let Some(i) = state.selected_image {
+                state.images.remove(i);
+                state.thumbnails.remove(i);
+                let path = state.image_paths.remove(i).unwrap();
+
+                if i > 0 {
+                    state.selected_image.replace(i - 1);
+                }
+
+                if let Err(e) = fs::rename(&path, state.trash.join(&path.file_name().unwrap())) {
+                    return Task::done(Message::SetMessage(format!(
+                        "delete {:?}: {}",
+                        &path,
+                        e.to_string()
+                    )));
                 }
             }
         }
@@ -782,31 +727,95 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
     Task::none()
 }
 
+fn setup_request(state: &mut State) -> ImageGenRequest {
+    let mut req = ImageGenRequest::default();
+
+    req.prompt(state.base_prompt.text());
+
+    let new_seed = state.rng.random_range(1e9..9e9) as u64;
+    req.seed(state.current_seed.unwrap_or(new_seed));
+    state.previous_seed = new_seed;
+    state.current_seed = None;
+
+    req.height_width(state.image_shape);
+
+    for cc in &mut state.character_prompts {
+        if cc.content.text() == "\n" {
+            continue;
+        }
+        cc.c.prompt(cc.content.text());
+        req.add_character(&cc.c);
+    }
+
+    if state
+        .character_prompts
+        .iter()
+        .any(|ch| ch.c.get_center() == Point { x: 0.5, y: 0.5 })
+    {
+        req.use_coords(true);
+    } else {
+        req.use_coords(false);
+    }
+    req
+}
+
+async fn generate_many(
+    semaphore: Arc<Semaphore>,
+    r: Arc<Requester>,
+    req: ImageGenRequest,
+    seeds: Vec<u64>,
+) -> Vec<Result<(Bytes, PathBuf), ImageGenerationError>> {
+    let mut jhs = Vec::new();
+    for seed in seeds {
+        let semaphore = semaphore.clone();
+        let r = r.clone();
+
+        let mut req = req.clone();
+        req.seed(seed);
+
+        let jh = tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
+            let resp = r.generate_image(req).await;
+            drop(_permit);
+            resp
+        });
+        jhs.push(jh);
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    }
+
+    let mut ret = Vec::new();
+    for jh in jhs {
+        let resp = jh.await.unwrap();
+        ret.push(resp);
+    }
+    ret
+}
+
 fn handle_event(state: &mut State, e: Event) -> Task<Message> {
     match e {
         Event::Keyboard(ref e) => match e {
-            keyboard::Event::KeyPressed { key, .. } => match key.as_ref() {
-                Key::Named(Named::ArrowUp) => {
+            keyboard::Event::KeyPressed { key, modifiers, .. } => {
+                if key.as_ref() == Key::Named(Named::ArrowUp) && modifiers.command() {
                     return Task::done(Message::FocusAdjacent(Direction::Up));
                 }
-                Key::Named(Named::ArrowDown) => {
+                if key.as_ref() == Key::Named(Named::ArrowDown) && modifiers.command() {
                     return Task::done(Message::FocusAdjacent(Direction::Down));
                 }
-                Key::Named(Named::ArrowLeft) => {
+                if key.as_ref() == Key::Named(Named::ArrowLeft) && modifiers.command() {
                     return Task::done(Message::FocusAdjacent(Direction::Left));
                 }
-                Key::Named(Named::ArrowRight) => {
+                if key.as_ref() == Key::Named(Named::ArrowRight) && modifiers.command() {
                     return Task::done(Message::FocusAdjacent(Direction::Right));
                 }
-                _ => (),
-            },
+            }
             _ => (),
         },
         Event::Mouse(ref _e) => (),
         Event::Window(ref e) => match e {
             window::Event::FileDropped(path) => {
-                if let Some((prompt, characters)) = get_prompt_metadata(path) {
-                    return Task::done(Message::ImportPrompt(prompt, characters));
+                if let Some((seed, prompt, characters)) = get_prompt_metadata(path) {
+                    return Task::done(Message::ImportPrompt(seed, prompt, characters));
                 }
             }
             _ => (),
@@ -819,7 +828,7 @@ fn handle_event(state: &mut State, e: Event) -> Task<Message> {
             match pane.id {
                 PaneId::Files => return handle_event_files(state, e),
                 PaneId::Prompts => (),
-                PaneId::Image => (),
+                PaneId::Image => return handle_event_image(state, e),
             }
         }
     }
@@ -854,11 +863,11 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
                                         .extension()
                                         .is_some_and(|s| s.to_string_lossy().ends_with("png"))
                                 {
-                                    if let Some((prompt, characters)) =
+                                    if let Some((seed, prompt, characters)) =
                                         get_prompt_metadata(&entry.path)
                                     {
                                         return Task::done(Message::ImportPrompt(
-                                            prompt, characters,
+                                            seed, prompt, characters,
                                         ));
                                     }
                                 }
@@ -940,6 +949,39 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
 
                     _ => (),
                 },
+                _ => (),
+            }
+        }
+        _ => (),
+    }
+    Task::none()
+}
+
+fn handle_event_image(state: &mut State, e: Event) -> Task<Message> {
+    match e {
+        Event::Keyboard(e) => {
+            let current_index = state.selected_image;
+
+            match e {
+                keyboard::Event::KeyPressed { key, modifiers, .. } => {
+                    if key.as_ref() == Key::Character("d") && modifiers.shift() {
+                        return Task::done(Message::DeleteImageHistory);
+                    }
+                    if key.as_ref() == Key::Named(Named::ArrowUp) {
+                        if let Some(i) = current_index {
+                            if i > 0 {
+                                state.selected_image.replace(i - 1);
+                            }
+                        }
+                    }
+                    if key.as_ref() == Key::Named(Named::ArrowDown) {
+                        if let Some(i) = current_index {
+                            if i + 1 < state.images.len() {
+                                state.selected_image.replace(i + 1);
+                            }
+                        }
+                    }
+                }
                 _ => (),
             }
         }
@@ -1048,83 +1090,61 @@ fn view_files(state: &State) -> Element<Message> {
 }
 
 fn view_prompts(state: &State) -> Element<Message> {
-    let base_combobox = combo_box(
-        &state.base_options,
+    let base_select = combo_box(
+        &state.base.options,
         "base",
-        state.base_selected.as_ref(),
+        state.base.selected.as_ref(),
         Message::BasePromptSelected,
     );
 
-    let character_combobox = combo_box(
-        &state.char_options,
+    let char_select = combo_box(
+        &state.char.options,
         "character",
-        state.char_selected.as_ref(),
+        state.char.selected.as_ref(),
         Message::CharacterPromptSelected,
     );
 
-    let template_combobox = combo_box(
-        &state.template_options,
+    let template_select = combo_box(
+        &state.template.options,
         "template",
-        state.template_selected.as_ref(),
+        state.template.selected.as_ref(),
         Message::TemplateSelected,
     );
 
     let char_dropdown = pick_list(
-        [
-            CharacterNum::Char1,
-            CharacterNum::Char2,
-            CharacterNum::Char3,
-            CharacterNum::Char4,
-            CharacterNum::Char5,
-            CharacterNum::Char6,
-        ],
-        Some(state.curr_char),
+        [1, 2, 3, 4, 5, 6],
+        Some(state.curr_char + 1),
         Message::CharSelected,
     );
 
-    let prompt_boxes = row![
-        char_dropdown,
-        base_combobox,
-        character_combobox,
-        template_combobox
-    ];
+    let select_prompt = row![char_dropdown, base_select, char_select, template_select];
 
     let save_prompt = button(text("Save Prompt")).on_press(Message::SavePrompt);
-    let base_rename = text_input("rename base_prompt", &state.base_rename)
+    let base_rename = text_input("rename base_prompt", &state.base.rename)
         .on_input(Message::EditRenameBasePrompt)
         .on_submit(Message::SubmitRenameBasePrompt);
-    let char_rename = text_input("rename character_prompt", &state.char_rename)
+    let char_rename = text_input("rename character_prompt", &state.char.rename)
         .on_input(Message::EditRenameCharacterPrompt)
         .on_submit(Message::SubmitRenameCharacterPrompt);
-    let template_rename = text_input("rename template", &state.template_rename)
+    let template_rename = text_input("rename template", &state.template.rename)
         .on_input(Message::EditRenameTemplate)
         .on_submit(Message::SubmitRenameTemplate);
-    let save_rename = row![save_prompt, base_rename, char_rename, template_rename];
+    let save_rename =
+        row![save_prompt, base_rename, char_rename, template_rename].align_y(Alignment::Center);
 
-    let text_areas = column![
-        text_editor(&state.base_prompt)
+    let mut text_areas = Column::with_capacity(7).spacing(10);
+    text_areas = text_areas.push(
+        widget::text_editor(&state.base_prompt)
             .placeholder("base prompt")
             .on_action(Message::EditBasePrompt),
-        text_editor(&state.c1.content)
-            .placeholder("character 1")
-            .on_action(Message::EditChar1),
-        text_editor(&state.c2.content)
-            .placeholder("character 2")
-            .on_action(Message::EditChar2),
-        text_editor(&state.c3.content)
-            .placeholder("character 3")
-            .on_action(Message::EditChar3),
-        text_editor(&state.c4.content)
-            .placeholder("character 4")
-            .on_action(Message::EditChar4),
-        text_editor(&state.c5.content)
-            .placeholder("character 5")
-            .on_action(Message::EditChar5),
-        text_editor(&state.c6.content)
-            .placeholder("character 6")
-            .on_action(Message::EditChar6),
-    ]
-    .spacing(10);
+    );
+    for (i, cc) in state.character_prompts.iter().enumerate() {
+        text_areas = text_areas.push(
+            widget::text_editor(&cc.content)
+                .placeholder("")
+                .on_action(move |action| Message::EditCharPrompt((i, action))),
+        );
+    }
 
     use Position::*;
     let position_grid = column![
@@ -1165,28 +1185,40 @@ fn view_prompts(state: &State) -> Element<Message> {
         ],
     ];
 
-    let previous_seed = text(format!("previous seed: {}", state.previous_seed));
-    let current_seed = text(format!(
-        "current seed: {}",
-        state.current_seed.unwrap_or_default()
-    ));
+    let current_seed = text(state.current_seed.unwrap_or_default());
     let copy_seed = button(text("Use Previous Seed")).on_press(Message::CopySeed);
     let clear_seed = button(text("Clear Seed")).on_press(Message::ClearSeed);
-    let seed = row![
-        column![previous_seed, copy_seed],
-        column![current_seed, clear_seed]
-    ];
+    let seed = row![text("Seed: "), current_seed, copy_seed, clear_seed];
+
+    let orientation = pick_list(
+        [
+            ImageShape::Portrait,
+            ImageShape::Landscape,
+            ImageShape::Square,
+        ],
+        Some(state.image_shape),
+        Message::ImageShape,
+    );
 
     let mut content = Column::with_children([
-        prompt_boxes.into(),
+        select_prompt.into(),
         save_rename.into(),
         text_areas.into(),
         position_grid.into(),
         seed.into(),
+        orientation.into(),
     ]);
 
-    content = content.push_maybe(if !state.image_gen_ip {
-        Some(button("Submit").on_press(Message::SubmitRequest))
+    content = content.push_maybe(if !state.image_gen_ip && state.base_prompt.text() != "\n" {
+        Some(column![
+            row![button("Submit").on_press(Message::GenerateOne)],
+            row![
+                text_input("1", &state.num_generate_temp)
+                    .on_input(Message::EditNumGenerate)
+                    .on_submit(Message::NumGenerate),
+                button("Generate Many").on_press(Message::GenerateMany),
+            ]
+        ])
     } else {
         None
     });
@@ -1209,7 +1241,7 @@ fn view_image(state: &State) -> Element<Message> {
                 .map_or(None, |h| Some(Image::new(h).into()))
         });
 
-    let mut thumbs = Column::with_capacity(state.thumbnails.len());
+    let mut thumbs = Column::with_capacity(state.thumbnails.len()).align_x(Alignment::Center);
     for (index, handle) in state.thumbnails.iter().enumerate() {
         let style = if let Some(i) = state.selected_image {
             if i == index {
@@ -1242,11 +1274,7 @@ fn view_image(state: &State) -> Element<Message> {
     };
 
     let image_history = scrollable(thumbs);
-    row![
-        center(final_image),
-        column![text("image history"), image_history]
-    ]
-    .into()
+    row![center(final_image), image_history].into()
 }
 
 fn view_controls<'a>(pane: pane_grid::Pane, is_maximized: bool) -> Element<'a, Message> {
@@ -1314,61 +1342,26 @@ fn set_prompt_characters(state: &mut State, base: String, characters: Vec<String
         .perform(Action::Edit(Edit::Paste(Arc::new(base))));
 
     for (i, c) in characters.iter().enumerate() {
-        match i {
-            0 => {
-                state.c1.content.perform(Action::SelectAll);
-                state.c1.content.perform(Action::Edit(Edit::Delete));
-                state
-                    .c1
-                    .content
-                    .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
-            }
-            1 => {
-                state.c2.content.perform(Action::SelectAll);
-                state.c2.content.perform(Action::Edit(Edit::Delete));
-                state
-                    .c2
-                    .content
-                    .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
-            }
-            2 => {
-                state.c3.content.perform(Action::SelectAll);
-                state.c3.content.perform(Action::Edit(Edit::Delete));
-                state
-                    .c3
-                    .content
-                    .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
-            }
-            3 => {
-                state.c4.content.perform(Action::SelectAll);
-                state.c4.content.perform(Action::Edit(Edit::Delete));
-                state
-                    .c4
-                    .content
-                    .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
-            }
-            4 => {
-                state.c5.content.perform(Action::SelectAll);
-                state.c5.content.perform(Action::Edit(Edit::Delete));
-                state
-                    .c5
-                    .content
-                    .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
-            }
-            5 => {
-                state.c6.content.perform(Action::SelectAll);
-                state.c6.content.perform(Action::Edit(Edit::Delete));
-                state
-                    .c6
-                    .content
-                    .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
-            }
-            _ => (),
-        }
+        state.character_prompts[i]
+            .content
+            .perform(Action::SelectAll);
+        state.character_prompts[i]
+            .content
+            .perform(Action::Edit(Edit::Delete));
+        state.character_prompts[i]
+            .content
+            .perform(Action::Edit(Edit::Paste(Arc::new(c.clone()))));
     }
 }
 
-fn get_prompt_characters(meta: Map<String, Value>) -> (String, Vec<String>) {
+fn get_prompt_characters(meta: Map<String, Value>) -> (u64, String, Vec<String>) {
+    let seed = meta
+        .get("Comment")
+        .unwrap()
+        .get("seed")
+        .unwrap()
+        .as_u64()
+        .unwrap();
     let caption = meta
         .get("Comment")
         .unwrap()
@@ -1388,10 +1381,12 @@ fn get_prompt_characters(meta: Map<String, Value>) -> (String, Vec<String>) {
     for c in characters {
         character_prompts.push(c.get("char_caption").unwrap().as_str().unwrap().to_owned());
     }
-    (prompt, character_prompts)
+    (seed, prompt, character_prompts)
 }
 
-pub fn get_prompt_metadata<P: AsRef<std::path::Path>>(path: P) -> Option<(String, Vec<String>)> {
+pub fn get_prompt_metadata<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Option<(u64, String, Vec<String>)> {
     if path
         .as_ref()
         .extension()
@@ -1408,6 +1403,15 @@ pub fn get_prompt_metadata<P: AsRef<std::path::Path>>(path: P) -> Option<(String
 
 pub fn subscribe(_state: &State) -> Subscription<Message> {
     event::listen().map(Message::Event)
+}
+
+#[derive(Debug, Clone)]
+struct PromptUi<V> {
+    kind: PromptKind,
+    options: combo_box::State<String>,
+    map: FastHashMap<String, V>,
+    selected: Option<String>,
+    rename: String,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -1429,14 +1433,14 @@ impl Display for FilesMode {
 
 struct CharacterContent {
     c: nai::Character,
-    content: text_editor::Content,
+    content: widget::text_editor::Content,
 }
 
 impl CharacterContent {
     fn new() -> Self {
         Self {
             c: nai::Character::new(),
-            content: text_editor::Content::new(),
+            content: widget::text_editor::Content::new(),
         }
     }
 }
@@ -1478,29 +1482,6 @@ impl Hash for PromptHistoryEntry {
                 .copied()
                 .collect::<Vec<u8>>(),
         );
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CharacterNum {
-    Char1,
-    Char2,
-    Char3,
-    Char4,
-    Char5,
-    Char6,
-}
-
-impl fmt::Display for CharacterNum {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Char1 => write!(f, "char1"),
-            Self::Char2 => write!(f, "char2"),
-            Self::Char3 => write!(f, "char3"),
-            Self::Char4 => write!(f, "char4"),
-            Self::Char5 => write!(f, "char5"),
-            Self::Char6 => write!(f, "char6"),
-        }
     }
 }
 

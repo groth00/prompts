@@ -3,6 +3,16 @@
 - Changed
 - Removed
 
+
+2025-07-29
+image history deletion
+  - bind to shift + d while image pane is focused and check state.selected_image
+    - trash file, remove from state.images and state.thumbnails
+    - decrement index; saturate at 0
+add option to change orientation of image
+set seed when right clicking image
+
+
 2025-07-28
 - Added
 save prompt
@@ -29,6 +39,7 @@ load and save prompts to sqlite
 - Fixed
 - Changed
 - Removed
+
 
 2025-07-23 to 2025-07-24
 

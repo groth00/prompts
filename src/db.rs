@@ -38,23 +38,13 @@ pub enum PromptData {
 
 pub struct Template {
     pub base: String,
-    pub c1: Option<String>,
-    pub c2: Option<String>,
-    pub c3: Option<String>,
-    pub c4: Option<String>,
-    pub c5: Option<String>,
-    pub c6: Option<String>,
+    pub characters: [Option<String>; 6],
 }
 
 struct TemplateWithName {
     name: String,
     base: String,
-    c1: Option<String>,
-    c2: Option<String>,
-    c3: Option<String>,
-    c4: Option<String>,
-    c5: Option<String>,
-    c6: Option<String>,
+    characters: [Option<String>; 6],
 }
 
 pub struct PromptDb {
@@ -135,12 +125,14 @@ pub fn fetch_prompts(
         Ok(TemplateWithName {
             name: r.get::<usize, String>(0)?,
             base: r.get::<usize, String>(1)?,
-            c1: r.get::<usize, Option<String>>(2)?,
-            c2: r.get::<usize, Option<String>>(3)?,
-            c3: r.get::<usize, Option<String>>(4)?,
-            c4: r.get::<usize, Option<String>>(5)?,
-            c5: r.get::<usize, Option<String>>(6)?,
-            c6: r.get::<usize, Option<String>>(7)?,
+            characters: [
+                r.get::<usize, Option<String>>(2)?,
+                r.get::<usize, Option<String>>(3)?,
+                r.get::<usize, Option<String>>(4)?,
+                r.get::<usize, Option<String>>(5)?,
+                r.get::<usize, Option<String>>(6)?,
+                r.get::<usize, Option<String>>(7)?,
+            ],
         })
     })?;
     for row in t {
@@ -150,12 +142,7 @@ pub fn fetch_prompts(
             row.name,
             Template {
                 base: row.base,
-                c1: row.c1,
-                c2: row.c2,
-                c3: row.c3,
-                c4: row.c4,
-                c5: row.c5,
-                c6: row.c6,
+                characters: row.characters,
             },
         );
     }
@@ -194,12 +181,14 @@ pub fn load_prompt(
             PromptData::Template(conn.query_one(s_template, params![name], |r| {
                 Ok(Template {
                     base: r.get::<usize, String>(0)?,
-                    c1: r.get::<usize, Option<String>>(1)?,
-                    c2: r.get::<usize, Option<String>>(2)?,
-                    c3: r.get::<usize, Option<String>>(3)?,
-                    c4: r.get::<usize, Option<String>>(4)?,
-                    c5: r.get::<usize, Option<String>>(5)?,
-                    c6: r.get::<usize, Option<String>>(6)?,
+                    characters: [
+                        r.get::<usize, Option<String>>(1)?,
+                        r.get::<usize, Option<String>>(2)?,
+                        r.get::<usize, Option<String>>(3)?,
+                        r.get::<usize, Option<String>>(4)?,
+                        r.get::<usize, Option<String>>(5)?,
+                        r.get::<usize, Option<String>>(6)?,
+                    ],
                 })
             })?)
         }
@@ -294,7 +283,7 @@ pub async fn import_from_dir<P: AsRef<Path>>(dir: P) -> Result<usize, SqliteErro
                 .duration_since(UNIX_EPOCH)
                 .expect("duration_since")
                 .as_secs() as i64;
-            if let Some((prompt, characters)) = get_prompt_metadata(entry.path()) {
+            if let Some((_seed, prompt, characters)) = get_prompt_metadata(entry.path()) {
                 metadata.push((ts, prompt, characters));
             }
         }

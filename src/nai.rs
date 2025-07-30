@@ -2,6 +2,7 @@ use std::{
     fmt::{self, Display},
     fs::{self},
     io::Cursor,
+    path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -61,18 +62,15 @@ impl Display for ImageGenerationError {
 }
 
 impl Requester {
-    pub async fn generate_image<'a>(
+    pub async fn generate_image(
         &self,
-        shape: ImageShape,
-        mut req: ImageGenRequest<'a>,
-    ) -> Result<(Bytes, String), ImageGenerationError> {
-        req.height_width(shape);
-
+        req: ImageGenRequest,
+    ) -> Result<(Bytes, PathBuf), ImageGenerationError> {
         let (bytes, end) = self.call_service(&req).await?;
         eprintln!("{} elapsed", end);
 
         let bytes_clone = bytes.clone();
-        let res = spawn_blocking(move || -> Result<String, ImageGenerationError> {
+        let res = spawn_blocking(move || -> Result<PathBuf, ImageGenerationError> {
             let output_path = save_image(bytes_clone)
                 .map_err(|e| ImageGenerationError::ZipError(e.to_string()))?;
             Ok(output_path)
@@ -84,9 +82,9 @@ impl Requester {
         Ok((bytes, res))
     }
 
-    pub async fn call_service<'a>(
+    pub async fn call_service(
         &self,
-        params: &ImageGenRequest<'a>,
+        params: &ImageGenRequest,
     ) -> Result<(Bytes, f64), ImageGenerationError> {
         let mut headers = HeaderMap::new();
         headers.insert("Content-Type", "application/json".parse().unwrap());
@@ -151,7 +149,7 @@ impl Requester {
     }
 }
 
-pub fn save_image(bytes: Bytes) -> ZipResult<String> {
+pub fn save_image(bytes: Bytes) -> ZipResult<PathBuf> {
     let reader = Cursor::new(bytes);
     let mut archive = ZipArchive::new(reader)?;
     let mut file = archive.by_index(0)?;
@@ -163,23 +161,23 @@ pub fn save_image(bytes: Bytes) -> ZipResult<String> {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let output_path = format!("output/{}.png", now);
+    let mut output_path = PathBuf::from("output").join(now.to_string());
+    output_path.set_extension("png");
     fs::write(&output_path, &buf)?;
 
     Ok(output_path)
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(bound(deserialize = "'de: 'a"))]
-pub struct ImageGenRequest<'a> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageGenRequest {
     action: Action,
     /// base prompt; max length 40_000
     input: String,
     model: Model,
-    parameters: RequestParameters<'a>,
+    parameters: RequestParameters,
 }
 
-impl<'a> Default for ImageGenRequest<'a> {
+impl Default for ImageGenRequest {
     fn default() -> Self {
         Self {
             action: Action::default(),
@@ -190,7 +188,7 @@ impl<'a> Default for ImageGenRequest<'a> {
     }
 }
 
-impl<'a> ImageGenRequest<'a> {
+impl ImageGenRequest {
     pub fn height_width(&mut self, shape: ImageShape) {
         self.parameters.width = shape.as_width_height().0;
         self.parameters.height = shape.as_width_height().1;
@@ -230,11 +228,11 @@ impl<'a> ImageGenRequest<'a> {
         self.parameters.v4_prompt.use_coords = enable;
     }
 
-    pub fn get_prompt(&self) -> String {
+    pub fn _get_prompt(&self) -> String {
         self.input.clone()
     }
 
-    pub fn get_characters(&self) -> Vec<String> {
+    pub fn _get_characters(&self) -> Vec<String> {
         let mut ret = Vec::with_capacity(6);
         for ch in &self.parameters.character_prompts {
             ret.push(ch.prompt.clone());
@@ -243,9 +241,8 @@ impl<'a> ImageGenRequest<'a> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(bound(deserialize = "'de: 'a"))]
-struct RequestParameters<'a> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RequestParameters {
     #[serde(skip_serializing_if = "Option::is_none")]
     add_original_image: Option<bool>,
     #[serde(rename = "autoSmea")]
@@ -277,7 +274,7 @@ struct RequestParameters<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     mask: Option<String>,
     n_samples: u8,
-    negative_prompt: &'a str,
+    negative_prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     noise: Option<f32>,
     noise_schedule: NoiseSchedule,
@@ -320,7 +317,7 @@ struct RequestParameters<'a> {
     width: u32,
 }
 
-impl Default for RequestParameters<'_> {
+impl Default for RequestParameters {
     fn default() -> Self {
         Self {
             cfg_rescale: 0.5,
@@ -333,7 +330,7 @@ impl Default for RequestParameters<'_> {
             legacy_uc: false,
             legacy_v3_extend: false,
             n_samples: 1,
-            negative_prompt: NEGATIVE_PROMPT,
+            negative_prompt: NEGATIVE_PROMPT.into(),
             noise_schedule: NoiseSchedule::default(),
             params_version: 3,
             prefer_brownian: true,
@@ -415,7 +412,7 @@ impl Character {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V4Prompt {
     pub caption: Caption,
     pub use_coords: bool,
@@ -432,7 +429,7 @@ impl Default for V4Prompt {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct V4NegativePrompt {
     pub caption: Caption,
     pub legacy_uc: bool,
@@ -450,13 +447,13 @@ impl Default for V4NegativePrompt {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Caption {
     pub base_caption: String,
     pub char_captions: Vec<CharCaption>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CharCaption {
     pub char_caption: String,
     pub centers: Vec<Point>,
@@ -537,7 +534,7 @@ impl Position {
 }
 
 #[allow(dead_code)]
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub enum ImageShape {
     #[default]
     Portrait,
@@ -565,7 +562,23 @@ impl ImageShape {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+impl Display for ImageShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use ImageShape::*;
+        match self {
+            Portrait => write!(f, "Portrait"),
+            Landscape => write!(f, "Landscape"),
+            Square => write!(f, "Square"),
+            PortraitLarge => write!(f, "Portrait Large"),
+            LandscapeLarge => write!(f, "Landscape Large"),
+            SquareLarge => write!(f, "Square Large"),
+            PortraitWallpaper => write!(f, "Portrait Wallpaper"),
+            LandscapeWallpaper => write!(f, "Landscape Wallpaper"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Action {
     #[default]
@@ -574,7 +587,7 @@ enum Action {
     Img2Img,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Model {
     #[default]
@@ -595,21 +608,21 @@ enum Model {
     // nai-diffusion-3
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum NoiseSchedule {
     #[default]
     Karras,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Sampler {
     #[default]
     KEulerAncestral,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Stream {
     #[default]
@@ -617,7 +630,7 @@ enum Stream {
     Sse,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 struct Img2ImgParameters {
     color_correct: bool,
     extra_noise_seed: u8,

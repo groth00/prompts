@@ -2,6 +2,7 @@
 /target
 /novelai-api
 /text
+/temp
 /output
 
 .env

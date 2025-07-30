@@ -1,5 +1,3 @@
-use std::fs;
-
 use clap::{Parser, Subcommand};
 use iced::window::{get_latest, maximize};
 
@@ -12,7 +10,6 @@ mod nai;
 mod ui;
 
 use db::import_from_dir;
-use nai::{Character, ImageGenRequest, ImageShape, Requester};
 use ui::{State, subscribe, update, view};
 
 fn main() -> iced::Result {
@@ -28,40 +25,13 @@ fn main() -> iced::Result {
         Commands::Ui => {
             iced::application("NovelAI Desktop App", update, view)
                 .subscription(subscribe)
+                .theme(|_state| iced::Theme::TokyoNightStorm)
                 .run_with(|| {
                     (
                         State::default(),
                         get_latest().and_then(|id| maximize(id, true)),
                     )
                 })?;
-        }
-        Commands::Gen => {
-            let s = fs::read_to_string("prompt.txt").expect("open prompt.txt");
-
-            let mut req = ImageGenRequest::default();
-            let mut base_prompt = "";
-            let mut chars = vec![];
-            req.seed(rand::random_range(1e9..9e9) as u64);
-
-            for (i, s) in s.lines().enumerate() {
-                if i == 0 {
-                    base_prompt = s;
-                } else {
-                    chars.push(Character::new().prompt(s.into()).finish());
-                }
-            }
-            req.prompt(base_prompt.to_owned());
-
-            for ch in chars {
-                req.add_character(&ch);
-            }
-
-            runtime.block_on(async {
-                let requester = Requester::default();
-                if let Err(e) = requester.generate_image(ImageShape::Portrait, req).await {
-                    eprintln!("{:?}", e);
-                }
-            });
         }
         Commands::Metadata { path } => {
             let im = image::open(path).expect("open");
@@ -93,7 +63,6 @@ struct Args {
 #[derive(Subcommand)]
 enum Commands {
     Ui,
-    Gen,
     Metadata {
         path: String,
     },
