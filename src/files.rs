@@ -141,6 +141,8 @@ pub struct FilesState {
     pub visible: Vec<VisibleEntry>,
     // control how many entries to render
     pub view_offset: usize,
+
+    /// right-most bit = create_folder_mode
     pub flags: u64,
 }
 

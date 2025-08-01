@@ -3,10 +3,18 @@
 - Changed
 - Removed
 
+2025-08-01
+- Added
+bidirectional communication via channels for image generation (iced
+subscription)
+- pause & resume task spawning, cancel in-flight requests
+
+
 2025-07-30
 - Added
 update and delete base/char/template
 files pane create folder
+theme selector
 
 - Fixed
 scale thumbnails correctly

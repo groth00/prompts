@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
-use iced::window::{get_latest, maximize};
+use iced::{
+    Subscription,
+    window::{get_latest, maximize},
+};
 
 mod image_metadata;
 use image_metadata::extract_image_metadata;
@@ -9,8 +12,10 @@ mod files;
 mod nai;
 mod ui;
 
-use db::import_from_dir;
-use ui::{State, subscribe, update, view};
+use crate::{
+    db::import_from_dir,
+    ui::{State, event_subscribe, run_channel_subscription, update, view},
+};
 
 fn main() -> iced::Result {
     dotenvy::dotenv().expect("dotenv");
@@ -24,8 +29,10 @@ fn main() -> iced::Result {
     match &args.command {
         Commands::Ui => {
             iced::application("NovelAI Desktop App", update, view)
-                .subscription(subscribe)
-                .theme(|_state| iced::Theme::TokyoNightStorm)
+                .subscription(|state| {
+                    Subscription::batch([event_subscribe(state), run_channel_subscription()])
+                })
+                .theme(|state| state.selected_theme.clone())
                 .run_with(|| {
                     (
                         State::default(),

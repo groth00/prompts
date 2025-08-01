@@ -2,29 +2,30 @@ use std::{
     collections::VecDeque,
     fmt::{self, Display},
     fs,
-    hash::{Hash, Hasher},
     io::Cursor,
     path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
 use iced::{
     Alignment, Element, Event,
     Length::{self},
-    Subscription, Task, event,
+    Subscription, Task, Theme, event,
+    futures::{SinkExt, Stream, channel::mpsc::Sender},
     keyboard::{
         self,
         key::{Key, Named},
     },
+    stream,
     widget::{
         self, Column, Image, PaneGrid, button, center, column, combo_box, container,
         image::Handle,
         mouse_area,
         pane_grid::{self, Axis, Configuration, Direction},
         pick_list, row, scrollable,
-        shader::wgpu::naga::FastHashMap,
+        shader::wgpu::naga::{FastHashMap, FastIndexMap},
         text,
         text_editor::{Action, Edit},
         text_input,
@@ -36,7 +37,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rand::{Rng, distr::Uniform, rngs::ThreadRng};
 use serde_json::{Map, Value};
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, task::JoinHandle};
 use zip::ZipArchive;
 
 use crate::{
@@ -56,8 +57,13 @@ const FILE_EXTENSIONS: [&'static str; 3] = ["jpeg", "jpg", "png"];
 const MAX_VISIBLE: usize = 40;
 
 pub struct State {
-    semaphore: Arc<Semaphore>,
+    task_state: TaskState,
+    task_ids: Vec<u64>,
+
+    pub selected_theme: Theme,
+
     message: Option<String>,
+
     panes: pane_grid::State<Pane>,
     focus: Option<pane_grid::Pane>,
 
@@ -76,21 +82,21 @@ pub struct State {
 
     previous_seed: u64,
     current_seed: Option<u64>,
-    num_generate_temp: String,
-    num_generate: u8,
+    num_generate: String,
 
-    temp: Vec<(Vec<usize>, PathBuf)>,
+    files: FilesState,
     files_mode: FilesMode,
     new_folder_name: String,
-
-    image_gen_ip: bool,
     cache: FastHashMap<PathBuf, Handle>,
-    files: FilesState,
-    client: Arc<Requester>,
+    /// when selecting file entries in FilesMode::Batch
+    temp: Vec<(Vec<usize>, PathBuf)>,
+
     images: VecDeque<Vec<u8>>,
-    selected_image: Option<usize>,
     thumbnails: VecDeque<Handle>,
+    selected_image: Option<usize>,
     image_paths: VecDeque<PathBuf>,
+    /// TODO: currently used when deleting images from image_history;
+    /// also want to use this dir for delete_file
     trash: PathBuf,
 }
 
@@ -138,8 +144,16 @@ impl Default for State {
         };
 
         let state = Self {
-            semaphore: Arc::new(Semaphore::new(1)),
+            task_state: TaskState {
+                ready: ChannelReady::NotReady,
+                status: ChannelStatus::NotReady,
+            },
+            task_ids: Vec::new(),
+
+            selected_theme: Theme::CatppuccinMacchiato,
+
             message: None,
+
             panes,
             focus: None,
 
@@ -178,22 +192,17 @@ impl Default for State {
 
             previous_seed: 0,
             current_seed: None,
-            num_generate_temp: String::new(),
-            num_generate: 1,
+            num_generate: 1.to_string(),
 
-            // history: Vec::new(),
-            temp: Vec::new(),
             files_mode: FilesMode::Normal,
-            new_folder_name: String::new(),
-
-            image_gen_ip: false,
-            cache: FastHashMap::default(),
             files: FilesState::new("."),
-            client: Arc::new(Requester::default()),
+            new_folder_name: String::new(),
+            cache: FastHashMap::default(),
+            temp: Vec::new(),
 
             images: VecDeque::new(),
-            selected_image: None,
             thumbnails: VecDeque::new(),
+            selected_image: None,
             image_paths: VecDeque::new(),
             trash,
         };
@@ -277,9 +286,15 @@ impl State {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Event(Event),
-    SetMessage(String),
+    // no-op for Task::perform
+    Dummy,
 
+    Event(Event),
+
+    SetMessage(String),
+    SelectedTheme(Theme),
+
+    // pane
     FocusAdjacent(pane_grid::Direction),
     Clicked(pane_grid::Pane),
     Dragged(pane_grid::DragEvent),
@@ -287,21 +302,49 @@ pub enum Message {
     Maximize(pane_grid::Pane),
     Restore,
 
+    // edit prompt / request parameters
     EditBasePrompt(widget::text_editor::Action),
     EditCharPrompt((usize, widget::text_editor::Action)),
     CharSelected(usize),
     SetPosition(Position),
-
     CopySeed,
     ClearSeed,
-    EditNumGenerate(String),
-    NumGenerate,
     ImageShape(ImageShape),
-    GenerateOne,
-    GenerateMany,
-    ImageGenerated(Result<(Bytes, PathBuf), ImageGenerationError>),
-    ImagesGenerated(Vec<Result<(Bytes, PathBuf), ImageGenerationError>>),
 
+    // generate
+    EditNumGenerate(String),
+    Generate,
+
+    // to channel
+    Pause,
+    Resume,
+    Cancel(u64),
+    Create((u64, ImageGenRequest)),
+
+    // from channel
+    Channel(ChannelEvent),
+
+    // prompt crud
+    BasePromptSelected(String),
+    CharacterPromptSelected(String),
+    TemplateSelected(String),
+    StorePrompt,
+    SavedPrompt(Result<(), SqliteError>),
+    UpdatePrompt(PromptKind),
+    DeletePrompt(PromptKind),
+    EditRenameBasePrompt(String),
+    EditRenameCharacterPrompt(String),
+    EditRenameTemplate(String),
+    SubmitRenameBasePrompt,
+    SubmitRenameCharacterPrompt,
+    SubmitRenameTemplate,
+
+    // image pane
+    ImageClicked(usize),
+    MetadataFromImage(usize),
+    DeleteImageHistory,
+
+    // files pane
     Entries((Vec<usize>, Vec<Entry>)),
     ToggleExpand(Vec<usize>),
     Refresh,
@@ -317,31 +360,15 @@ pub enum Message {
     SelectEntry,
     CreateFolder,
     FolderName(String),
-
-    BasePromptSelected(String),
-    CharacterPromptSelected(String),
-    TemplateSelected(String),
-    StorePrompt,
-    SavedPrompt(Result<(), SqliteError>),
-    UpdatePrompt(PromptKind),
-    DeletePrompt(PromptKind),
-    EditRenameBasePrompt(String),
-    EditRenameCharacterPrompt(String),
-    EditRenameTemplate(String),
-    SubmitRenameBasePrompt,
-    SubmitRenameCharacterPrompt,
-    SubmitRenameTemplate,
-
-    ImageClicked(usize),
-    MetadataFromImage(usize),
-    DeleteImageHistory,
 }
 
 pub fn update(state: &mut State, msg: Message) -> Task<Message> {
     use Message::*;
     match msg {
+        Dummy => (),
         Event(e) => return handle_event(state, e),
         SetMessage(s) => state.message = Some(s),
+        SelectedTheme(theme) => state.selected_theme = theme,
 
         // pane
         FocusAdjacent(direction) => {
@@ -388,66 +415,99 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
         ImageShape(shape) => {
             state.image_shape = shape;
         }
-        EditNumGenerate(s) => state.num_generate_temp = s,
-        NumGenerate => match state.num_generate_temp.parse::<u8>() {
-            Ok(num) => {
-                state.num_generate = num;
-                return Task::done(Message::SetMessage("set num_generate".into()));
+        EditNumGenerate(s) => state.num_generate = s,
+        Generate => {
+            if state.base_prompt.text() == "\n" || state.base_prompt.text().is_empty() {
+                return Task::done(Message::SetMessage(
+                    "must have at least the base prompt".into(),
+                ));
             }
-            Err(e) => return Task::done(Message::SetMessage(e.to_string())),
-        },
-        GenerateOne => {
-            state.image_gen_ip = true;
 
-            let req = setup_request(state);
-            let r = Arc::clone(&state.client);
+            if let ChannelReady::Ready(tx) = &mut state.task_state.ready {
+                if let Ok(num_generate) = state.num_generate.parse::<u64>() {
+                    let mut tx = tx.clone();
+                    let req = setup_request(state);
 
-            return Task::perform(async move { r.generate_image(req).await }, |r| {
-                Message::ImageGenerated(r)
-            });
-        }
-        GenerateMany => {
-            state.image_gen_ip = true;
+                    let between = Uniform::new(1e8 as u64, 9e9 as u64).unwrap();
+                    let seeds: Vec<u64> = (&mut state.rng)
+                        .sample_iter(between)
+                        .take(num_generate as usize)
+                        .collect();
 
-            let req = setup_request(state);
-            let num_generate = state.num_generate;
-            let semaphore = Arc::clone(&state.semaphore);
-            let client = Arc::clone(&state.client);
-
-            let between = Uniform::new(1e8 as u64, 9e9 as u64).unwrap();
-            let seeds: Vec<u64> = (&mut state.rng)
-                .sample_iter(between)
-                .take(num_generate as usize)
-                .collect();
-
-            return Task::perform(generate_many(semaphore, client, req, seeds), |results| {
-                Message::ImagesGenerated(results)
-            });
-        }
-        ImageGenerated(res) => {
-            state.image_gen_ip = false;
-
-            match res {
-                Err(e) => state.message = Some(e.to_string()),
-                Ok((bytes, path)) => {
-                    state.message = Some("generated image".into());
-                    state.insert_image(bytes, path);
-                }
-            }
-        }
-        ImagesGenerated(results) => {
-            state.image_gen_ip = false;
-
-            for r in results {
-                match r {
-                    Err(e) => state.message = Some(e.to_string()),
-                    Ok((bytes, path)) => {
-                        state.message = Some("generated image".into());
-                        state.insert_image(bytes, path);
+                    for i in &seeds {
+                        state.task_ids.push(*i);
                     }
+
+                    return Task::perform(
+                        async move {
+                            for i in seeds {
+                                let _ = tx.send(Message::Create((i, req.clone()))).await;
+                            }
+                        },
+                        // generate_many(semaphore, client, req, seeds), |results| {
+                        |_r| Message::Dummy,
+                    );
                 }
             }
         }
+        Channel(ChannelEvent::TaskReady(main_tx)) => {
+            state.task_state.ready = ChannelReady::Ready(main_tx);
+            state.task_state.status = ChannelStatus::Ready;
+        }
+        Channel(ChannelEvent::Generated(id, res)) => match res {
+            Err(e) => state.message = Some(e.to_string()),
+            Ok((bytes, path)) => {
+                state.message = Some("generated image".into());
+                state.insert_image(bytes, path);
+                if let Some(index) = state.task_ids.iter().position(|i| *i == id) {
+                    state.task_ids.remove(index);
+                }
+            }
+        },
+        Channel(ChannelEvent::Cancelled(id)) => {
+            println!("aborted task {}", id);
+        }
+
+        Pause => {
+            state.task_state.status = ChannelStatus::Paused;
+            if let ChannelReady::Ready(tx) = &mut state.task_state.ready {
+                let mut tx = tx.clone();
+                return Task::perform(
+                    async move {
+                        let _ = tx.send(Message::Pause).await;
+                    },
+                    |_| Message::Dummy,
+                );
+            }
+        }
+        Resume => {
+            state.task_state.status = ChannelStatus::Ready;
+            if let ChannelReady::Ready(tx) = &mut state.task_state.ready {
+                let mut tx = tx.clone();
+                return Task::perform(
+                    async move {
+                        let _ = tx.send(Message::Resume).await;
+                    },
+                    |_| Message::Dummy,
+                );
+            }
+        }
+        Cancel(id) => {
+            if let Some(index) = state.task_ids.iter().position(|i| *i == id) {
+                state.task_ids.remove(index);
+            }
+
+            if let ChannelReady::Ready(tx) = &mut state.task_state.ready {
+                let mut tx = tx.clone();
+                return Task::perform(
+                    async move {
+                        let _ = tx.send(Message::Cancel(id)).await;
+                    },
+                    |_| Message::Dummy,
+                );
+            }
+        }
+        Create(..) => (),
 
         // files
         Entries((path, mut entries)) => {
@@ -1071,7 +1131,7 @@ pub fn view(state: &State) -> Element<Message> {
         let title_bar = pane_grid::TitleBar::new(title)
             .controls(pane_grid::Controls::dynamic(
                 view_controls(id, is_maximized),
-                text("foobar"),
+                text("Controls"),
             ))
             .padding(10)
             .style(if is_focused {
@@ -1110,6 +1170,23 @@ fn view_files(state: &State) -> Element<Message> {
     let end = (state.files.view_offset + MAX_VISIBLE).min(state.files.visible.len());
     let slice = &state.files.visible[state.files.view_offset..end];
 
+    let theme_selector = pick_list(
+        [
+            Theme::CatppuccinLatte,
+            Theme::CatppuccinFrappe,
+            Theme::CatppuccinMacchiato,
+            Theme::CatppuccinMocha,
+            Theme::TokyoNight,
+            Theme::TokyoNightStorm,
+            Theme::TokyoNightLight,
+            Theme::KanagawaWave,
+            Theme::KanagawaDragon,
+            Theme::KanagawaLotus,
+        ],
+        Some(&state.selected_theme),
+        Message::SelectedTheme,
+    );
+
     let mut col = slice
         .iter()
         .enumerate()
@@ -1145,7 +1222,9 @@ fn view_files(state: &State) -> Element<Message> {
             };
 
             col.push(text(label).style(style))
-        });
+        })
+        .padding(4)
+        .spacing(2);
 
     col = col.push_maybe(if state.files.create_folder() {
         Some(
@@ -1159,7 +1238,7 @@ fn view_files(state: &State) -> Element<Message> {
 
     let mode = text(state.files_mode.to_string());
 
-    scrollable(column![col, mode]).into()
+    scrollable(column![theme_selector, col, mode].padding(2).spacing(4)).into()
 }
 
 fn view_prompts(state: &State) -> Element<Message> {
@@ -1218,7 +1297,8 @@ fn view_prompts(state: &State) -> Element<Message> {
         row![text("Delete"), delete_base, delete_char, delete_template]
             .align_y(Alignment::Center)
             .spacing(4),
-    ];
+    ]
+    .align_x(Alignment::Start);
 
     let mut text_areas = Column::with_capacity(7).spacing(10);
     text_areas = text_areas.push(
@@ -1276,7 +1356,9 @@ fn view_prompts(state: &State) -> Element<Message> {
     let current_seed = text(state.current_seed.unwrap_or_default());
     let copy_seed = button(text("Use Previous Seed")).on_press(Message::CopySeed);
     let clear_seed = button(text("Clear Seed")).on_press(Message::ClearSeed);
-    let seed = row![text("Seed: "), current_seed, copy_seed, clear_seed].align_y(Alignment::Center);
+    let seed = row![text("Seed: "), current_seed, copy_seed, clear_seed]
+        .align_y(Alignment::Center)
+        .spacing(4);
 
     let orientation = pick_list(
         [
@@ -1288,6 +1370,29 @@ fn view_prompts(state: &State) -> Element<Message> {
         Message::ImageShape,
     );
 
+    let num_images = column![
+        text_input("1", &state.num_generate).on_input(Message::EditNumGenerate),
+        button("Generate").on_press(Message::Generate),
+    ];
+
+    let mut ids = Column::with_capacity(state.task_ids.len());
+    for i in &state.task_ids {
+        ids = ids.push(row![
+            text(i),
+            button("Cancel").on_press(Message::Cancel(*i))
+        ]);
+    }
+    let task_ids = scrollable(ids);
+
+    let generate_controls = column![
+        num_images,
+        text(format!("Status: {}", state.task_state.status)),
+        button("Pause").on_press(Message::Pause),
+        button("Resume").on_press(Message::Resume),
+        task_ids,
+    ]
+    .spacing(4);
+
     let mut content = Column::with_children([
         select_prompt.into(),
         rename.into(),
@@ -1296,23 +1401,10 @@ fn view_prompts(state: &State) -> Element<Message> {
         position_grid.into(),
         seed.into(),
         orientation.into(),
+        generate_controls.into(),
     ])
     .padding(2)
     .spacing(4);
-
-    content = content.push_maybe(if !state.image_gen_ip && state.base_prompt.text() != "\n" {
-        Some(column![
-            row![button("Submit").on_press(Message::GenerateOne)],
-            row![
-                text_input("1", &state.num_generate_temp)
-                    .on_input(Message::EditNumGenerate)
-                    .on_submit(Message::NumGenerate),
-                button("Generate Many").on_press(Message::GenerateMany),
-            ]
-        ])
-    } else {
-        None
-    });
 
     content = content.push_maybe(if let Some(message) = &state.message {
         Some(text(message))
@@ -1416,39 +1508,6 @@ fn setup_request(state: &mut State) -> ImageGenRequest {
         req.use_coords(false);
     }
     req
-}
-
-async fn generate_many(
-    semaphore: Arc<Semaphore>,
-    r: Arc<Requester>,
-    req: ImageGenRequest,
-    seeds: Vec<u64>,
-) -> Vec<Result<(Bytes, PathBuf), ImageGenerationError>> {
-    let mut jhs = Vec::new();
-    for seed in seeds {
-        let semaphore = semaphore.clone();
-        let r = r.clone();
-
-        let mut req = req.clone();
-        req.seed(seed);
-
-        let jh = tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
-            let resp = r.generate_image(req).await;
-            drop(_permit);
-            resp
-        });
-        jhs.push(jh);
-
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-    }
-
-    let mut ret = Vec::new();
-    for jh in jhs {
-        let resp = jh.await.unwrap();
-        ret.push(resp);
-    }
-    ret
 }
 
 fn delete_file(state: &mut State) -> Task<Message> {
@@ -1557,8 +1616,159 @@ pub fn get_prompt_metadata<P: AsRef<std::path::Path>>(
     None
 }
 
-pub fn subscribe(_state: &State) -> Subscription<Message> {
+pub fn event_subscribe(_state: &State) -> Subscription<Message> {
     event::listen().map(Message::Event)
+}
+
+pub fn run_channel_subscription() -> Subscription<Message> {
+    Subscription::run(channel_subscribe).map(Message::Channel)
+}
+
+fn channel_subscribe() -> impl Stream<Item = ChannelEvent> {
+    use iced::futures::{FutureExt, StreamExt, channel::mpsc, pin_mut, select};
+    use tokio::time;
+
+    stream::channel(200, |mut output| async move {
+        let (main_tx, main_rx) = mpsc::channel(200);
+        let mut rx = main_rx.fuse();
+        let mut interval = time::interval(Duration::from_millis(1000));
+
+        let mut paused = false;
+        let mut buf: VecDeque<(u64, ImageGenRequest)> = VecDeque::with_capacity(64);
+        let mut in_flight: FastIndexMap<
+            u64,
+            JoinHandle<Result<(Bytes, PathBuf), ImageGenerationError>>,
+        > = FastIndexMap::default();
+        let client = Arc::new(Requester::default());
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        let _ = output.send(ChannelEvent::TaskReady(main_tx)).await;
+        println!("sent TaskReady");
+
+        loop {
+            let tick = interval.tick().fuse();
+
+            pin_mut!(tick);
+
+            select! {
+                input = rx.select_next_some() => {
+                    match input {
+                        Message::Cancel(id) => {
+                            println!("rcv cancel");
+                            if let Some(handle) = in_flight.shift_remove(&id) {
+                                handle.abort();
+                                let _ = output.send(ChannelEvent::Cancelled(id)).await;
+                            }
+                        }
+                        Message::Pause => {
+                            println!("rcv pause");
+                            paused = true;
+                        }
+                        Message::Resume => {
+                            println!("rcv resume");
+                            paused = false;
+
+                            while let Some((seed, mut req)) = buf.pop_front() {
+                                println!("resumed creating task {}", seed);
+
+                                let client = Arc::clone(&client);
+                                let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+                                let jh = tokio::spawn(async move {
+                                    let _permit = permit;
+                                    req.seed(seed);
+
+                                    let result = client.generate_image(req).await;
+
+                                    time::sleep(Duration::from_millis(1250)).await;
+
+                                    result
+                                });
+                                in_flight.insert(seed, jh);
+                            }
+                        }
+                        Message::Create((seed, mut req)) => {
+                            if paused {
+                                buf.push_back((seed, req));
+                            } else {
+                                println!("creating task {}", seed);
+
+                                let client = Arc::clone(&client);
+                                let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+                                let jh = tokio::spawn(async move {
+                                    let _permit = permit;
+                                    req.seed(seed);
+
+                                    let result = client.generate_image(req).await;
+                                    result
+                                });
+                                in_flight.insert(seed, jh);
+                            }
+                        }
+                        _ => (),
+                    }
+                }
+
+                _ = tick => {
+                     let done: Vec<u64> = in_flight
+                         .iter()
+                         .filter(|(_id, handle)| handle.is_finished())
+                         .map(|(&id, _handle)| id)
+                         .collect();
+
+                     for id in done {
+                         if let Some(handle) = in_flight.shift_remove(&id) {
+                             match handle.await {
+                                 Ok(res) => {
+                                     let _ = output.send(ChannelEvent::Generated(id, res)).await;
+                                 }
+                                 Err(e) if e.is_cancelled() => {
+                                     let _ = output.send(ChannelEvent::Cancelled(id)).await;
+                                 }
+                                 Err(e) => eprintln!("task {} failed: {}", id, e),
+                             }
+                         }
+                     }
+
+                }
+            }
+        }
+    })
+}
+
+struct TaskState {
+    // sender
+    ready: ChannelReady,
+
+    // for ui only
+    status: ChannelStatus,
+}
+
+enum ChannelStatus {
+    NotReady,
+    Ready,
+    Paused,
+}
+
+impl Display for ChannelStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotReady => write!(f, "Not Ready"),
+            Self::Ready => write!(f, "Ready"),
+            Self::Paused => write!(f, "Paused"),
+        }
+    }
+}
+
+enum ChannelReady {
+    NotReady,
+    Ready(Sender<Message>),
+}
+
+#[derive(Debug, Clone)]
+pub enum ChannelEvent {
+    Generated(u64, Result<(Bytes, PathBuf), ImageGenerationError>),
+    Cancelled(u64),
+    TaskReady(Sender<Message>),
 }
 
 #[derive(Debug, Clone)]
@@ -1600,46 +1810,6 @@ impl CharacterContent {
             c: nai::Character::new(),
             content: widget::text_editor::Content::new(),
         }
-    }
-}
-
-struct PromptHistoryEntry {
-    timestamp: u64,
-    prompt: String,
-    characters: Vec<String>,
-}
-
-impl PartialOrd for PromptHistoryEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(&other))
-    }
-}
-
-impl Ord for PromptHistoryEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.timestamp.cmp(&other.timestamp)
-    }
-}
-
-impl PartialEq for PromptHistoryEntry {
-    fn eq(&self, other: &PromptHistoryEntry) -> bool {
-        self.prompt == other.prompt && self.characters == other.characters
-    }
-}
-
-impl Eq for PromptHistoryEntry {}
-
-impl Hash for PromptHistoryEntry {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write(self.prompt.as_bytes());
-        state.write(
-            &self
-                .characters
-                .iter()
-                .flat_map(|s| s.as_bytes())
-                .copied()
-                .collect::<Vec<u8>>(),
-        );
     }
 }
 
@@ -1729,37 +1899,5 @@ mod style {
             },
             ..Default::default()
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use iced::widget::shader::wgpu::naga::FastHashSet;
-
-    #[test]
-    fn history1() {
-        let h1 = PromptHistoryEntry {
-            timestamp: 1,
-            prompt: "foobar".into(),
-            characters: vec!["foo".into()],
-        };
-        let h2 = PromptHistoryEntry {
-            timestamp: 2,
-            prompt: "foobar".into(),
-            characters: vec!["foo".into()],
-        };
-        let h3 = PromptHistoryEntry {
-            timestamp: 10,
-            prompt: "this is the newest prompt".into(),
-            characters: vec!["foo".into(), "bar".into()],
-        };
-
-        let mut set = FastHashSet::default();
-        set.insert(h1);
-        set.insert(h2);
-        set.insert(h3);
-
-        assert_eq!(set.len(), 2);
     }
 }

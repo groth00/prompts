@@ -11,6 +11,7 @@ use rand::distr::{Alphanumeric, SampleString};
 use reqwest::{Client, Method, StatusCode, header::HeaderMap};
 use serde::{Deserialize, Serialize};
 use tokio::task::spawn_blocking;
+
 use zip::{read::ZipArchive, result::ZipResult};
 
 const NOVELAI_ENDPOINT: &str = "https://image.novelai.net/ai/generate-image";
@@ -30,34 +31,8 @@ impl Default for Requester {
             .build()
             .expect("build");
         let api_token = std::env::var("NOVELAI_API_KEY").expect("missing api key");
+
         Self { client, api_token }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum ImageGenerationError {
-    FailedAfterMaxAttempts,
-    SendRequest(String),
-    ClientError(String),
-    Deserialization(String),
-    ZipError(String),
-    JoinError,
-}
-
-impl Display for ImageGenerationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use ImageGenerationError::*;
-        match self {
-            FailedAfterMaxAttempts => write!(f, "failed to generate after max attempts"),
-            JoinError => write!(
-                f,
-                "something went wrong with the background task to save the image"
-            ),
-            SendRequest(err) => write!(f, "{}", err),
-            ClientError(err) => write!(f, "{}", err),
-            Deserialization(err) => write!(f, "read response bytes: {}", err),
-            ZipError(err) => write!(f, "zip: {}", err),
-        }
     }
 }
 
@@ -103,8 +78,8 @@ impl Requester {
             .build()
             .expect("failed to build request");
 
-        let mut attempts = 0;
-        let mut wait = 3;
+        let mut attempts = 3;
+        let wait = 5;
         let resp = loop {
             let resp = self
                 .client
@@ -122,7 +97,6 @@ impl Requester {
                     return Err(ImageGenerationError::FailedAfterMaxAttempts);
                 }
                 tokio::time::sleep(Duration::from_secs(wait)).await;
-                wait += 1;
                 attempts -= 1;
                 eprintln!(
                     "{}: {:?} ({} attempts left)",
@@ -146,6 +120,33 @@ impl Requester {
             .map_err(|e| ImageGenerationError::Deserialization(e.to_string()))?;
 
         Ok((bytes, start.elapsed().as_secs_f64()))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ImageGenerationError {
+    FailedAfterMaxAttempts,
+    SendRequest(String),
+    ClientError(String),
+    Deserialization(String),
+    ZipError(String),
+    JoinError,
+}
+
+impl Display for ImageGenerationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use ImageGenerationError::*;
+        match self {
+            FailedAfterMaxAttempts => write!(f, "failed to generate after max attempts"),
+            JoinError => write!(
+                f,
+                "something went wrong with the background task to save the image"
+            ),
+            SendRequest(err) => write!(f, "{}", err),
+            ClientError(err) => write!(f, "{}", err),
+            Deserialization(err) => write!(f, "read response bytes: {}", err),
+            ZipError(err) => write!(f, "zip: {}", err),
+        }
     }
 }
 
@@ -397,10 +398,6 @@ impl Character {
     pub fn center(&mut self, pos: Position) -> &mut Self {
         self.center = pos.as_point();
         self
-    }
-
-    pub fn finish(&self) -> Self {
-        self.clone()
     }
 
     pub fn get_prompt(&self) -> &str {
