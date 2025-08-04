@@ -358,6 +358,7 @@ pub enum Message {
     ImportPrompt(u64, String, Vec<String>),
     Delete,
     MoveBatch,
+    DeleteBatch,
     FilesPaneMode(FilesMode),
     SelectEntry,
     CreateFolder,
@@ -596,16 +597,11 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
         }
         Delete => return delete_file(state),
         MoveBatch => {
-            if state.files.selected.len() == 1 {
-                return Task::done(Message::SetMessage(String::from(
-                    "moving files into the current directory is not supported",
-                )));
-            }
+            let mut zombies: Vec<Entry> = Vec::with_capacity(state.temp.len());
 
-            // NOTE: don't screw around with the fs while this happens or they'll really be zombies
-            let mut zombies: Vec<Entry> = vec![];
-            for (parent_path, entry_pathbuf) in &mut state.temp {
-                if let Some(parent) = selected_entry_mut(&mut state.files.entries, parent_path) {
+            // for each selected entry, find and remove it from its parent's children vec
+            for (parent_path, entry_pathbuf) in state.temp.drain(..) {
+                if let Some(parent) = selected_entry_mut(&mut state.files.entries, &parent_path) {
                     if let Some(children) = &mut parent.children {
                         if let Some(pos) = children.iter().position(|e| e.path == *entry_pathbuf) {
                             zombies.push(children.remove(pos));
@@ -617,17 +613,20 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
             if let Some(new_parent) =
                 selected_entry_mut(&mut state.files.entries, &state.files.selected)
             {
-                state.temp.clear();
-                state
-                    .temp
-                    .push((state.files.selected.clone(), new_parent.path.clone()));
+                for zo in &mut zombies {
+                    zo.clear_selected(); // remove UI text style
 
-                for zo in &zombies {
-                    if let Err(e) = fs::rename(
-                        &zo.path,
-                        new_parent.path.join(&zo.path.file_name().unwrap()),
-                    ) {
-                        eprintln!("move: {}", e);
+                    if let Some(name) = &zo.path.file_name() {
+                        let new_name = new_parent.path.join(name);
+
+                        if let Err(e) = fs::rename(&zo.path, &new_name) {
+                            eprintln!("move {:?} to {:?}: {}", &zo.path, &new_name, e);
+                        } else {
+                            println!("move {:?} to {:?}", &zo.path, &new_name);
+                        }
+
+                        // update the path to reflect new parent
+                        zo.path = new_name;
                     }
                 }
                 match &mut new_parent.children {
@@ -638,6 +637,36 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
             }
             state.files.visible.clear();
             init_visible(&state.files.entries, &mut state.files.visible, 0, vec![]);
+        }
+        DeleteBatch => {
+            for (parent_path, entry_pathbuf) in state.temp.drain(..) {
+                if let Some(parent) = selected_entry_mut(&mut state.files.entries, &parent_path) {
+                    if let Some(children) = &mut parent.children {
+                        let removed = children.remove(
+                            children
+                                .iter()
+                                .position(|e| e.path == entry_pathbuf)
+                                .unwrap(),
+                        );
+
+                        if removed.kind == EntryKind::File {
+                            if let Err(e) = fs::rename(
+                                &removed.path,
+                                state.trash.join(&removed.path.file_name().unwrap()),
+                            ) {
+                                return Task::done(Message::SetMessage(e.to_string()));
+                            }
+
+                            // evict image from memory (if it was opened)
+                            state.cache.remove(&removed.path);
+                        }
+                    }
+                }
+            }
+
+            state.files.visible.clear();
+            init_visible(&state.files.entries, &mut state.files.visible, 0, vec![]);
+            return Task::done(Message::SetMessage("deleted files".into()));
         }
         FilesPaneMode(mode) => {
             state.files_mode = mode;
@@ -1013,15 +1042,19 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
                     _ => (),
                 },
                 FilesMode::Batch => match e {
-                    keyboard::Event::KeyPressed { ref key, .. } => match key.as_ref() {
-                        Key::Character("s") => {
+                    keyboard::Event::KeyPressed {
+                        ref key, modifiers, ..
+                    } => {
+                        if key.as_ref() == Key::Character("s") {
                             return Task::done(Message::SelectEntry);
                         }
-                        Key::Character("m") => {
+                        if key.as_ref() == Key::Character("m") {
                             return Task::done(Message::MoveBatch);
                         }
-                        _ => (),
-                    },
+                        if key.as_ref() == Key::Character("d") && modifiers.shift() {
+                            return Task::done(Message::DeleteBatch);
+                        }
+                    }
                     _ => (),
                 },
                 _ => (),
@@ -1525,12 +1558,14 @@ fn delete_file(state: &mut State) -> Task<Message> {
         if entry.kind == EntryKind::File {
             let remove_path = entry.path.clone();
 
-            // remove from fs
-            if let Err(e) = fs::remove_file(&remove_path) {
+            if let Err(e) = fs::rename(
+                &remove_path,
+                state.trash.join(&remove_path.file_name().unwrap()),
+            ) {
                 return Task::done(Message::SetMessage(e.to_string()));
             }
 
-            // evict image from memory (if it was opened)
+            // evict image handle from memory (if it was opened)
             state.cache.remove(&remove_path);
 
             // remove from internal entries & update visible entries
