@@ -4,7 +4,7 @@ use iced::widget::shader::wgpu::naga::FastHashMap;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rand::distr::{Alphanumeric, SampleString};
-use rusqlite::{Connection, Error, OptionalExtension, params};
+use rusqlite::{Error, OptionalExtension, params};
 
 use crate::ui::get_prompt_metadata;
 
@@ -24,14 +24,6 @@ pub enum PromptKind {
     Template,
     Character,
     Base,
-}
-
-pub enum PromptData {
-    Template(Template),
-    CharacterPrompt(String),
-    BasePrompt(String),
-    Character(PromptDb),
-    Base(PromptDb),
 }
 
 pub struct Template {
@@ -152,44 +144,6 @@ pub fn fetch_prompts(
         template_options,
         template_map,
     ))
-}
-
-pub fn load_prompt(
-    conn: &mut Connection,
-    kind: PromptKind,
-    name: String,
-) -> Result<PromptData, Error> {
-    let s_template = include_str!("../sql/s_template.sql");
-    let s_char = "SELECT t FROM characters WHERE name = ?1";
-    let s_base = "SELECT t FROM base WHERE name = ?1";
-
-    let ret = match kind {
-        PromptKind::Base => PromptData::BasePrompt(
-            conn.query_one(s_base, params![name], |r| r.get::<usize, String>(0))?,
-        ),
-        PromptKind::Character => {
-            PromptData::CharacterPrompt(
-                conn.query_one(s_char, params![name], |r| r.get::<usize, String>(0))?,
-            )
-        }
-        PromptKind::Template => {
-            PromptData::Template(conn.query_one(s_template, params![name], |r| {
-                Ok(Template {
-                    base: r.get::<usize, String>(0)?,
-                    characters: [
-                        r.get::<usize, Option<String>>(1)?,
-                        r.get::<usize, Option<String>>(2)?,
-                        r.get::<usize, Option<String>>(3)?,
-                        r.get::<usize, Option<String>>(4)?,
-                        r.get::<usize, Option<String>>(5)?,
-                        r.get::<usize, Option<String>>(6)?,
-                    ],
-                })
-            })?)
-        }
-    };
-
-    Ok(ret)
 }
 
 pub async fn save_prompt(

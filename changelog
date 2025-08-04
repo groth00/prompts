@@ -3,6 +3,11 @@
 - Changed
 - Removed
 
+2025-08-04
+- Added
+last key press
+
+
 2025-08-01
 - Added
 bidirectional communication via channels for image generation (iced

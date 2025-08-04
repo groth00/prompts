@@ -61,6 +61,7 @@ pub struct State {
     task_ids: Vec<u64>,
 
     pub selected_theme: Theme,
+    last_key: Option<(Key, keyboard::Modifiers)>,
 
     message: Option<String>,
 
@@ -151,6 +152,7 @@ impl Default for State {
             task_ids: Vec::new(),
 
             selected_theme: Theme::CatppuccinMacchiato,
+            last_key: None,
 
             message: None,
 
@@ -918,6 +920,7 @@ fn handle_event(state: &mut State, e: Event) -> Task<Message> {
     match e {
         Event::Keyboard(ref e) => match e {
             keyboard::Event::KeyPressed { key, modifiers, .. } => {
+                state.last_key = Some((key.clone(), *modifiers));
                 if key.as_ref() == Key::Named(Named::ArrowUp) && modifiers.command() {
                     return Task::done(Message::FocusAdjacent(Direction::Up));
                 }
@@ -1238,7 +1241,14 @@ fn view_files(state: &State) -> Element<Message> {
 
     let mode = text(state.files_mode.to_string());
 
-    scrollable(column![theme_selector, col, mode].padding(2).spacing(4)).into()
+    let mut all = column![theme_selector, col, mode];
+    all = all.push_maybe(if let Some(k) = &state.last_key {
+        Some(text(format!("{:?} {:?}", k.0, k.1)))
+    } else {
+        None
+    });
+
+    scrollable(all.padding(2).spacing(4)).into()
 }
 
 fn view_prompts(state: &State) -> Element<Message> {
