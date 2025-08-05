@@ -1,4 +1,7 @@
+use std::{fs, sync::LazyLock};
+
 use clap::{Parser, Subcommand};
+use directories::ProjectDirs;
 use iced::{
     Subscription,
     window::{get_latest, maximize},
@@ -14,23 +17,58 @@ mod ui;
 
 use crate::{
     db::import_from_dir,
-    ui::{State, event_subscribe, run_channel_subscription, update, view},
+    ui::{
+        State, event_subscribe, run_channel_subscription, run_fsevent_subscription, update, view,
+    },
 };
+
+static PROJECT_DIRS: LazyLock<ProjectDirs> = LazyLock::new(|| {
+    let proj_dirs = ProjectDirs::from("com", "groth", "prompts")
+        .expect("can't create project directories on this platform");
+
+    let data_dir = proj_dirs.data_dir();
+    match fs::exists(data_dir) {
+        Ok(b) => {
+            if !b {
+                fs::create_dir_all(data_dir).expect("failed to create project data_dir");
+            }
+        }
+        Err(e) => panic!("{}", e),
+    };
+
+    let output_dir = data_dir.join("output");
+    match fs::exists(&output_dir) {
+        Ok(b) => {
+            if !b {
+                fs::create_dir(&output_dir).expect("failed to create image output dir");
+            }
+        }
+        Err(e) => panic!("{}", e),
+    }
+
+    proj_dirs
+});
 
 fn main() -> iced::Result {
     dotenvy::dotenv().expect("dotenv");
 
+    let args = Args::parse();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
-    let args = Args::parse();
 
     match &args.command {
         Commands::Ui => {
-            iced::application("NovelAI Desktop App", update, view)
+            std::env::set_current_dir(PROJECT_DIRS.data_dir()).expect("cannot access data_dir");
+
+            iced::application("NovelAI Prompts", update, view)
                 .subscription(|state| {
-                    Subscription::batch([event_subscribe(state), run_channel_subscription()])
+                    Subscription::batch([
+                        event_subscribe(state),
+                        run_channel_subscription(),
+                        // run_fsevent_subscription(),
+                    ])
                 })
                 .theme(|state| state.selected_theme.clone())
                 .run_with(|| {

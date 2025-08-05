@@ -195,6 +195,52 @@ pub fn selected_entry_mut<'a>(
     }
 }
 
+pub fn update_visible2(state: &mut FilesState, trail: &[usize]) {
+    if let Some(i) = state.visible.iter().position(|ve| ve.path == trail) {
+        let d = state.visible[i].depth;
+        let path = trail.to_owned();
+
+        if let Some(entry) = selected_entry(&state.entries, &path) {
+            let mut j = i + 1;
+            while j < state.visible.len() && state.visible[j].depth > d {
+                j += 1;
+            }
+            state.visible.drain(i + 1..j);
+
+            if entry.expanded() {
+                let mut visible = Vec::new();
+                let mut queue = vec![(path.clone(), d + 1)];
+
+                while let Some((current_path, depth)) = queue.pop() {
+                    if let Some(entry) = selected_entry(&state.entries, &current_path) {
+                        if entry.expanded() {
+                            if let Some(children) = &entry.children {
+                                for (i, _e) in children.iter().enumerate() {
+                                    let mut child_path = current_path.clone();
+                                    child_path.push(i);
+                                    visible.push(VisibleEntry {
+                                        path: child_path.clone(),
+                                        depth,
+                                    });
+                                    if let Some(_entry) = entry
+                                        .children
+                                        .as_ref()
+                                        .and_then(|v| v.get(i))
+                                        .filter(|e| e.expanded())
+                                    {
+                                        queue.push((child_path.clone(), depth + 1));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                state.visible.splice(i + 1..i + 1, visible);
+            }
+        }
+    }
+}
+
 pub fn update_visible(state: &mut FilesState) {
     if let Some(i) = state
         .visible

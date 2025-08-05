@@ -1,14 +1,17 @@
-- Added
-- Fixed
-- Changed
-- Removed
-
 2025-08-04
 - Added
 last key press
 batch delete
+
+- Changed
+use cross-platform directories via directories and trash crates
+
 - Fixed
 batch move
+navigateup logic
+
+- Removed
+unused code from files.rs and db.rs
 
 
 2025-08-01

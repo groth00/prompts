@@ -14,6 +14,8 @@ use tokio::task::spawn_blocking;
 
 use zip::{read::ZipArchive, result::ZipResult};
 
+use crate::PROJECT_DIRS;
+
 const NOVELAI_ENDPOINT: &str = "https://image.novelai.net/ai/generate-image";
 pub const NEGATIVE_PROMPT: &'static str = "lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page, blurry, lowres, error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, logo, too many watermarks, {{{bad eyes}}}, blurry eyes, fewer, extra, missing, worst quality, watermark, unfinished, displeasing, signature, extra digits, artistic error, username, scan, bad anatomy, @_@, mismatched pupils, heart-shaped pupils, glowing eyes, low quality, {{{bad}}}, normal quality, disfigured, flower, artist signature, watermark, monochrome, black bars, cinematic bars, plaque, wall ornament, speech bubble, extra arms, extra breasts, loli, child, amputee, missing limb, 1.22::extra fingers, long fingers, missing fingers, bad hands::, extra digit, fewer digits, mutation, white border, eyes without pupils, multiple views, 1.3::disembodied penis::, x-ray, fake animal ears, animal ears, 1.1::pubic hair, female pubic hair, male pubic hair::, censored, border, 1.2::sound effects, text::";
 
@@ -162,7 +164,8 @@ pub fn save_image(bytes: Bytes) -> ZipResult<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let mut output_path = PathBuf::from("output").join(now.to_string());
+
+    let mut output_path = PROJECT_DIRS.data_dir().join("output").join(now.to_string());
     output_path.set_extension("png");
     fs::write(&output_path, &buf)?;
 

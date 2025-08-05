@@ -33,6 +33,10 @@ use iced::{
     window,
 };
 use image::{GenericImageView, ImageReader};
+use notify::{
+    EventKind,
+    event::{CreateKind, ModifyKind},
+};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rand::{Rng, distr::Uniform, rngs::ThreadRng};
@@ -41,13 +45,14 @@ use tokio::{sync::Semaphore, task::JoinHandle};
 use zip::ZipArchive;
 
 use crate::{
+    PROJECT_DIRS,
     db::{
         PromptKind, SqliteError, Template, delete_prompt, fetch_prompts, save_prompt,
         update_prompt, update_prompt_name,
     },
     files::{
         Entry, EntryKind, FilesState, entries, init_visible, selected_entry, selected_entry_mut,
-        update_visible,
+        update_visible, update_visible2,
     },
     image_metadata::extract_image_metadata,
     nai::{self, ImageGenRequest, ImageGenerationError, ImageShape, Point, Position, Requester},
@@ -59,6 +64,7 @@ const MAX_VISIBLE: usize = 40;
 pub struct State {
     task_state: TaskState,
     task_ids: Vec<u64>,
+    notify_move: NotifyMove,
 
     pub selected_theme: Theme,
     last_key: Option<(Key, keyboard::Modifiers)>,
@@ -96,16 +102,20 @@ pub struct State {
     thumbnails: VecDeque<Handle>,
     selected_image: Option<usize>,
     image_paths: VecDeque<PathBuf>,
-    /// TODO: currently used when deleting images from image_history;
-    /// also want to use this dir for delete_file
-    trash: PathBuf,
 }
 
 impl Default for State {
     fn default() -> Self {
-        let sqlite_url = std::env::var("SQLITE_URL").expect("missing SQLITE_URL env var");
-        let manager = SqliteConnectionManager::file(sqlite_url);
+        let manager = SqliteConnectionManager::file(PROJECT_DIRS.data_dir().join("prompts.db"));
         let pool = r2d2::Pool::new(manager).expect("pool");
+
+        {
+            let conn = pool.get().unwrap();
+            conn.execute_batch(include_str!(
+                "../migrations/20250724234734_create_tables.up.sql"
+            ))
+            .expect("failed to create database tables");
+        }
 
         let (base_options, base_map, char_options, char_map, template_options, template_map) =
             fetch_prompts(pool.clone()).expect("fetch_prompts");
@@ -135,21 +145,16 @@ impl Default for State {
             b: Box::new(Configuration::Pane(image_pane)),
         });
 
-        let trash = if let Some(home) = std::env::home_dir() {
-            home.join(".Trash")
-        } else if let Err(_e) = fs::exists("trash") {
-            fs::create_dir("trash").expect("create trash dir");
-            PathBuf::from("trash")
-        } else {
-            PathBuf::from("trash")
-        };
-
         let state = Self {
             task_state: TaskState {
                 ready: ChannelReady::NotReady,
                 status: ChannelStatus::NotReady,
             },
             task_ids: Vec::new(),
+            notify_move: NotifyMove {
+                started: false,
+                entry: None,
+            },
 
             selected_theme: Theme::CatppuccinMacchiato,
             last_key: None,
@@ -197,7 +202,7 @@ impl Default for State {
             num_generate: 1.to_string(),
 
             files_mode: FilesMode::Normal,
-            files: FilesState::new("."),
+            files: FilesState::new(PROJECT_DIRS.data_dir()),
             new_folder_name: String::new(),
             cache: FastHashMap::default(),
             temp: Vec::new(),
@@ -206,7 +211,6 @@ impl Default for State {
             thumbnails: VecDeque::new(),
             selected_image: None,
             image_paths: VecDeque::new(),
-            trash,
         };
         state
     }
@@ -292,6 +296,7 @@ pub enum Message {
     Dummy,
 
     Event(Event),
+    FsEvent(notify::Event),
 
     SetMessage(String),
     SelectedTheme(Theme),
@@ -370,6 +375,125 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
     match msg {
         Dummy => (),
         Event(e) => return handle_event(state, e),
+        // BUG: move doesn't reflect at all
+        // delete doesn't reflect on subdirectories
+        // something is causing the entries to have relative paths, i don't know what it is
+        FsEvent(ev) => {
+            // assume only 1 entry ever appears in e.paths
+            if ev.paths[0]
+                .as_os_str()
+                .to_str()
+                .map_or(false, |s| s.contains(".DS_Store"))
+            {
+                return Task::none();
+            }
+
+            println!("{:?}", ev);
+            let trail = trail_from_path(&state.files, &ev.paths[0]);
+            println!("trail: {:?}", trail);
+
+            // NOTE: this check causes too many issues
+            // trail_from_path defaults to [0], which will not trigger a refresh
+            // if the 0th entry happens to be a closed directory
+
+            // if let Some(entry) = selected_entry(&state.files.entries, &trail) {
+            //     if entry.kind == EntryKind::Folder && !entry.expanded() {
+            //         return Task::none();
+            //     }
+            // }
+
+            // TODO: granular update visible at end of each branch
+            match ev.kind {
+                EventKind::Create(kind) => {
+                    let new_entry_kind = if kind == CreateKind::Folder {
+                        EntryKind::Folder
+                    } else {
+                        EntryKind::File
+                    };
+
+                    let new_entry = Entry {
+                        path: ev.paths[0].clone(),
+                        kind: new_entry_kind,
+                        flags: 0,
+                        children: None,
+                    };
+                    if trail.len() == 1 {
+                        state.files.entries.push(new_entry);
+                        state.files.entries.sort();
+                    } else {
+                        if let Some(entry) =
+                            selected_entry_mut(&mut state.files.entries, &trail[..trail.len() - 1])
+                        {
+                            match &mut entry.children {
+                                Some(c) => c.push(new_entry),
+                                None => entry.children = Some(vec![new_entry]),
+                            }
+                            entry.children.as_mut().unwrap().sort();
+                        }
+                    }
+                }
+                EventKind::Remove(..) => {
+                    if trail.len() == 1 {
+                        if let Some(i) = state
+                            .files
+                            .entries
+                            .iter()
+                            .position(|entry| entry.path == ev.paths[0])
+                        {
+                            state.files.entries.remove(i);
+                        }
+                    } else {
+                        if let Some(entry) =
+                            selected_entry_mut(&mut state.files.entries, &trail[..trail.len() - 1])
+                        {
+                            if let Some(children) = &mut entry.children {
+                                if let Some(index) =
+                                    children.iter().position(|entry| entry.path == ev.paths[0])
+                                {
+                                    children.remove(index);
+                                }
+                            }
+                        }
+                    }
+                }
+                EventKind::Modify(ModifyKind::Name(..)) => {
+                    if !state.notify_move.started {
+                        state.notify_move.started = !state.notify_move.started;
+                        // remove from old parent
+                        if let Some(entry) =
+                            selected_entry_mut(&mut state.files.entries, &trail[..trail.len() - 1])
+                        {
+                            if let Some(children) = &mut entry.children {
+                                if let Some(i) =
+                                    children.iter().position(|entry| entry.path == ev.paths[0])
+                                {
+                                    let removed = children.remove(i);
+                                    state.notify_move.entry = Some(removed);
+                                }
+                            }
+                        }
+                    } else {
+                        state.notify_move.started = !state.notify_move.started;
+                        // add to new parent
+                        if let Some(entry) =
+                            selected_entry_mut(&mut state.files.entries, &trail[..trail.len() - 1])
+                        {
+                            if let Some(children) = &mut entry.children {
+                                if let Some(entry) = state.notify_move.entry.take() {
+                                    children.push(entry);
+                                    children.sort();
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => (),
+            }
+
+            state.files.visible.clear();
+            init_visible(&state.files.entries, &mut state.files.visible, 0, vec![]);
+        }
+
         SetMessage(s) => state.message = Some(s),
         SelectedTheme(theme) => state.selected_theme = theme,
 
@@ -582,7 +706,11 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
             state.files.selected = vec![state.files.entries.len() - 1];
         }
         NavigateUp => {
-            state.files = FilesState::new("../");
+            if let Ok(cd) = std::env::current_dir() {
+                if let Some(parent) = cd.parent() {
+                    state.files = FilesState::new(parent);
+                }
+            }
         }
         SetRoot => {
             if let Some(entry) = selected_entry(&state.files.entries, &state.files.selected) {
@@ -639,27 +767,33 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
             init_visible(&state.files.entries, &mut state.files.visible, 0, vec![]);
         }
         DeleteBatch => {
+            println!("DELETE BATCH: {:?}", &state.temp);
             for (parent_path, entry_pathbuf) in state.temp.drain(..) {
-                if let Some(parent) = selected_entry_mut(&mut state.files.entries, &parent_path) {
-                    if let Some(children) = &mut parent.children {
-                        let removed = children.remove(
-                            children
-                                .iter()
+                let removed = if parent_path.len() == 1 {
+                    state
+                        .files
+                        .entries
+                        .iter()
+                        .position(|e| e.path == entry_pathbuf)
+                        .map_or(None, |i| Some(state.files.entries.remove(i)))
+                } else {
+                    selected_entry_mut(&mut state.files.entries, &parent_path).map_or(None, |e| {
+                        e.children.as_mut().map_or(None, |c| {
+                            c.iter()
                                 .position(|e| e.path == entry_pathbuf)
-                                .unwrap(),
-                        );
+                                .map_or(None, |i| Some(c.remove(i)))
+                        })
+                    })
+                };
 
-                        if removed.kind == EntryKind::File {
-                            if let Err(e) = fs::rename(
-                                &removed.path,
-                                state.trash.join(&removed.path.file_name().unwrap()),
-                            ) {
-                                return Task::done(Message::SetMessage(e.to_string()));
-                            }
-
-                            // evict image from memory (if it was opened)
-                            state.cache.remove(&removed.path);
+                if let Some(removed) = removed {
+                    if removed.kind == EntryKind::File {
+                        if let Err(e) = trash::delete(&removed.path) {
+                            return Task::done(Message::SetMessage(e.to_string()));
                         }
+
+                        // evict image from memory (if it was opened)
+                        state.cache.remove(&removed.path);
                     }
                 }
             }
@@ -692,11 +826,14 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
         SelectEntry => {
             if let Some(entry) = selected_entry_mut(&mut state.files.entries, &state.files.selected)
             {
+                let trail = if state.files.selected.len() == 1 {
+                    state.files.selected.clone()
+                } else {
+                    state.files.selected[..state.files.selected.len() - 1].to_vec()
+                };
+
                 entry.toggle_selected();
-                state.temp.push((
-                    state.files.selected[..state.files.selected.len() - 1].to_vec(),
-                    entry.path.clone(),
-                ));
+                state.temp.push((trail, entry.path.clone()));
             }
         }
         CreateFolder => {
@@ -932,7 +1069,7 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                     state.selected_image.replace(i - 1);
                 }
 
-                if let Err(e) = fs::rename(&path, state.trash.join(&path.file_name().unwrap())) {
+                if let Err(e) = trash::delete(&path) {
                     return Task::done(Message::SetMessage(format!(
                         "delete {:?}: {}",
                         &path,
@@ -1521,6 +1658,60 @@ fn view_controls<'a>(pane: pane_grid::Pane, is_maximized: bool) -> Element<'a, M
     row.into()
 }
 
+fn trail_from_path<P: AsRef<std::path::Path>>(state: &FilesState, p: P) -> Vec<usize> {
+    if let Ok(trimmed) = p.as_ref().strip_prefix(PROJECT_DIRS.data_dir()) {
+        println!("checking {:?}", trimmed);
+        let parts = trimmed
+            .to_str()
+            .unwrap_or_default()
+            .split("/")
+            .collect::<Vec<_>>();
+        if parts.len() == 1 {
+            return vec![0];
+        } else {
+            println!("parts: {:?}", parts);
+            let mut trail = vec![];
+
+            let mut root = &state.entries;
+            for p in parts {
+                println!("{:?}", root);
+                let index = root.iter().position(|e| {
+                    println!(
+                        "{:?} -> {:?}",
+                        &e.path,
+                        &e.path.strip_prefix(PROJECT_DIRS.data_dir())
+                    );
+                    if let Ok(entry_path) = e.path.strip_prefix(PROJECT_DIRS.data_dir()) {
+                        if let Some(s) = entry_path.to_str() {
+                            return s == p;
+                        }
+                    }
+                    false
+                });
+                if let Some(i) = index {
+                    trail.push(i);
+                    if let Some(children) = &root[i].children {
+                        root = children;
+                    } else {
+                        // the entry was not visited so there are no children
+                        // or the parameter is a path that doesn't exist
+
+                        // push placeholder so we are at the correct depth
+                        trail.push(0);
+                        return trail;
+                    }
+                } else {
+                    // push placeholder so we are at the correct depth
+                    trail.push(0);
+                    return trail;
+                }
+            }
+            return trail;
+        }
+    }
+    Vec::new()
+}
+
 fn setup_request(state: &mut State) -> ImageGenRequest {
     let mut req = ImageGenRequest::default();
 
@@ -1558,10 +1749,7 @@ fn delete_file(state: &mut State) -> Task<Message> {
         if entry.kind == EntryKind::File {
             let remove_path = entry.path.clone();
 
-            if let Err(e) = fs::rename(
-                &remove_path,
-                state.trash.join(&remove_path.file_name().unwrap()),
-            ) {
+            if let Err(e) = trash::delete(&remove_path) {
                 return Task::done(Message::SetMessage(e.to_string()));
             }
 
@@ -1780,6 +1968,50 @@ fn channel_subscribe() -> impl Stream<Item = ChannelEvent> {
     })
 }
 
+pub fn run_fsevent_subscription() -> Subscription<Message> {
+    Subscription::run(channel_fsevent).map(Message::FsEvent)
+}
+
+fn channel_fsevent() -> impl Stream<Item = notify::Event> {
+    use iced::futures::{StreamExt, channel::mpsc, executor};
+    use notify::Watcher;
+
+    stream::channel(64, |mut output| async move {
+        let (mut tx, mut rx) = mpsc::channel(64);
+
+        let mut watcher = notify::RecommendedWatcher::new(
+            move |res| {
+                executor::block_on(async {
+                    tx.send(res).await.unwrap();
+                })
+            },
+            notify::Config::default(),
+        )
+        .expect("failed to init watcher");
+
+        watcher
+            .watch(PROJECT_DIRS.data_dir(), notify::RecursiveMode::Recursive)
+            .expect("failed to watch project data_dir");
+
+        while let Some(res) = rx.next().await {
+            match res {
+                Ok(e) => {
+                    let _ = output.send(e).await.unwrap();
+                }
+                Err(e) => eprintln!("{}", e),
+            }
+        }
+    })
+}
+
+struct NotifyMove {
+    // modification events come in pairs,
+    // if false we have the path under the old parent
+    // if true we have the path under the new parent
+    started: bool,
+    entry: Option<Entry>,
+}
+
 struct TaskState {
     // sender
     ready: ChannelReady,
@@ -1944,5 +2176,34 @@ mod style {
             },
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{PROJECT_DIRS, files::FilesState, ui::trail_from_path};
+
+    #[test]
+    fn t_trail_from_path_l1() {
+        let state = FilesState::new(PROJECT_DIRS.data_dir());
+
+        let trail = trail_from_path(&state, PROJECT_DIRS.data_dir().join("prompts.db"));
+        assert_eq!(trail, vec![1]);
+    }
+
+    #[test]
+    fn t_trail_from_path_l2() {
+        let state = FilesState::new(PROJECT_DIRS.data_dir());
+
+        let trail = trail_from_path(&state, PROJECT_DIRS.data_dir().join("output/foo"));
+        assert_eq!(trail, vec![0, 0]);
+    }
+
+    #[test]
+    fn t_trail_from_path_l3() {
+        let state = FilesState::new(PROJECT_DIRS.data_dir());
+
+        let trail = trail_from_path(&state, PROJECT_DIRS.data_dir().join("output/subdir/bar"));
+        assert_eq!(trail, vec![0, 1, 0]);
     }
 }
