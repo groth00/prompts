@@ -12,6 +12,7 @@ use image_metadata::extract_image_metadata;
 
 mod db;
 mod files;
+mod files2;
 mod nai;
 mod ui;
 
