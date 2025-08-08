@@ -193,11 +193,37 @@ impl FileTree {
         );
         self.lookup.insert(path, id);
 
-        if let Some(pid) = parent {
-            if let Some(entry) = self.entries.get_mut(&pid) {
-                entry.children.as_mut().unwrap().push(id);
+        // find position to insert new entry into sorted children
+        let path = &self.entries.get(&id).unwrap().path.clone();
+
+        let pos = if let Some(pid) = parent {
+            if let Some(entry) = self.entries.get(&pid) {
+                Some(
+                    entry
+                        .children
+                        .as_ref()
+                        .unwrap()
+                        .binary_search_by(|cid| {
+                            let a = &self.entries.get(cid).unwrap().path;
+                            a.cmp(path)
+                        })
+                        .unwrap_or_else(|e| e),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(pos) = pos {
+            if let Some(pid) = parent {
+                if let Some(entry) = self.entries.get_mut(&pid) {
+                    entry.children.as_mut().unwrap().insert(pos, id);
+                }
             }
         }
+
         id
     }
 
@@ -235,16 +261,11 @@ impl FileTree {
         println!("visit_root: {:?}\n\n", &visible);
     }
 
-    // BUG: using a hashmap is not the answer
-    // modifications to FileTree.entries doesn't preserve any kind of order
-    // so visiting the entries will always result in the incorrect order
-    // wrong data structure.
     pub fn visit(&mut self, id: usize) {
         if let Some(entry) = self.entries.get(&id) {
             match entry.kind {
                 EntryKind::Folder => {
                     if let Some(entry) = self.get_entry(id) {
-                        // dbg!("preparing to update entry", entry);
                         let expanded = entry.expanded;
 
                         // find the insertion position into self.visible
@@ -256,14 +277,12 @@ impl FileTree {
                             .expect("invalid id");
                         let d = self.visible[i].depth;
 
-                        // dbg!("before drain", &self.visible);
                         // remove child visible entries
                         let mut j = i + 1;
                         while j < self.visible.len() && self.visible[j].depth > d {
                             j += 1;
                         }
                         self.visible.drain(i + 1..j);
-                        // dbg!("after drain", &self.visible);
 
                         if expanded {
                             let mut to_insert = Vec::new();
@@ -271,14 +290,11 @@ impl FileTree {
                             queue.push_front((self.selected, d + 1));
 
                             while let Some((i, depth)) = queue.pop_front() {
-                                // dbg!("processing", i, depth);
                                 if let Some(entry) = self.get_entry(i) {
                                     if entry.expanded {
                                         if let Some(children) = &entry.children {
-                                            // dbg!(children);
                                             for &j in children {
                                                 if let Some(child_entry) = self.get_entry(j) {
-                                                    // dbg!(child_entry);
                                                     to_insert.push(VisibleEntry { id: j, depth });
                                                     if child_entry.expanded {
                                                         queue.push_front((j, depth + 1));
@@ -290,7 +306,6 @@ impl FileTree {
                                 }
                             }
                             self.visible.splice(i + 1..i + 1, to_insert);
-                            // dbg!("after insertion: {:?}", &self.visible);
                         }
                     }
                 }
@@ -342,24 +357,10 @@ impl FileTree {
         }
     }
 
-    // TODO: separate keybind for create file and create folder
-    pub fn create(&mut self, path: PathBuf) -> Result<(), io::Error> {
-        let kind = if path.ends_with("/") {
-            EntryKind::Folder
-        } else {
-            EntryKind::File
-        };
-
+    pub fn create_folder(&mut self, path: PathBuf) -> Result<(), io::Error> {
         if let Some(entry) = self.get_entry(self.selected) {
-            match kind {
-                EntryKind::Folder => {
-                    let _ = fs::create_dir(entry.path.join(&path))?;
-                }
-                _ => {
-                    let _ = fs::File::create_new(entry.path.join(&path))?;
-                }
-            }
-            self.add(path, Some(entry.id), kind);
+            let _ = fs::create_dir(entry.path.join(&path))?;
+            self.add(path, Some(entry.id), EntryKind::Folder);
         }
 
         self.visit(self.selected);
@@ -367,7 +368,17 @@ impl FileTree {
         Ok(())
     }
 
-    // BUG: if the deleted entry has children, have to recursively delete
+    pub fn create_file(&mut self, path: PathBuf) -> Result<(), io::Error> {
+        if let Some(entry) = self.get_entry(self.selected) {
+            let _ = fs::File::create_new(entry.path.join(&path))?;
+            self.add(path, Some(entry.id), EntryKind::File);
+        }
+
+        self.visit(self.selected);
+
+        Ok(())
+    }
+
     pub fn delete(&mut self, id: usize) -> Result<(), io::Error> {
         self._delete(id)?;
 
@@ -405,29 +416,29 @@ impl FileTree {
             self.entries.remove(&id);
         }
 
+        self.delete_recursive(id);
+
         Ok(())
+    }
+
+    fn delete_recursive(&mut self, id: usize) {
+        let children = self.entries.get(&id).and_then(|e| e.children.clone());
+        if let Some(children) = children {
+            for c in children {
+                self.delete_recursive(c);
+            }
+            self.entries.remove(&id);
+        }
     }
 
     pub fn rename(&mut self, id: usize, new_parent: Option<usize>) -> Result<(), io::Error> {
-        let old_parent_id = self._rename(id, new_parent)?;
+        let _old_parent_id = self._rename(id, new_parent)?;
 
-        // _rename returns initial id if no action was taken
-        if id != old_parent_id {
-            if let Some(new_parent) = new_parent.and_then(|pid| self.get_parent(pid)) {
-                println!("visit new parent {}", new_parent.id);
-                self.visit(new_parent.id);
-            } else {
-                println!("visit root");
-                Self::visit_root(&self.entries, &mut self.visible);
-            }
-        } else {
-            panic!("nothing is visited after rename");
-        }
+        Self::visit_root(&self.entries, &mut self.visible);
 
         Ok(())
     }
 
-    // NOTE: things are not sorted after being moved
     fn _rename(&mut self, id: usize, new_parent: Option<usize>) -> Result<usize, io::Error> {
         if self.get_entry(id).is_none() {
             return Ok(id);
@@ -541,7 +552,6 @@ impl FileTree {
 
     pub fn batch_move(&mut self) -> Result<(), io::Error> {
         let to_rename = self.temp.clone();
-        println!("entries to move: {:?}\n\n", to_rename);
 
         let new_parent = if let Some(entry) = self.get_entry(self.selected) {
             Some(entry.id)
@@ -549,35 +559,14 @@ impl FileTree {
             None
         };
 
-        println!("before entries: {:?}\n\n", &self.entries.values());
-        println!("before visible: {:?}\n\n", &self.visible);
-
         for i in to_rename {
-            println!("moving {}\n", i);
             self._rename(i, new_parent)?;
         }
 
-        match new_parent {
-            Some(p) => {
-                println!("visiting new parent");
-                self.visit(p);
-            }
-            None => {
-                println!("resetting ui");
-                Self::visit_root(&self.entries, &mut self.visible);
-            }
-        }
-
-        println!("after entries: {:?}\n\n", &self.entries.values());
-
-        // this always is wrong despite the calls to visit / visit_root
-        println!("after visible: {:?}\n\n", &self.visible);
-
-        // NOTE: this clears self.temp
         self.clear_marked();
 
         // this fixes things but isn't ideal to reset ui state
-        // *self = FileTree::new(std::env::current_dir().unwrap());
+        *self = FileTree::new(std::env::current_dir().unwrap());
 
         Ok(())
     }
@@ -823,7 +812,7 @@ mod test {
         let entry = find(&tree, "temp").expect("temp not found");
 
         tree.selected = entry.1.id;
-        tree.create(PathBuf::from("foo")).expect("create");
+        tree.create_file(PathBuf::from("foo")).expect("create");
 
         let foo_path = std::env::current_dir().unwrap().join("temp/foo");
         let exists = fs::exists(foo_path);

@@ -602,11 +602,13 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
             if let Err(e) = state.files.batch_move() {
                 return Task::done(Message::SetMessage(e.to_string()));
             }
+            return Task::done(Message::FilesPaneMode(FilesMode::Normal));
         }
         DeleteBatch => {
             if let Err(e) = state.files.batch_delete() {
                 return Task::done(Message::SetMessage(e.to_string()));
             }
+            return Task::done(Message::FilesPaneMode(FilesMode::Normal));
         }
         FilesPaneMode(mode) => {
             state.files_mode = mode;
@@ -623,10 +625,18 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
             state.files.mark();
         }
         CreatePath => {
-            if let Err(e) = state.files.create(state.new_folder_name.clone().into()) {
+            let newpath: PathBuf = state.new_folder_name.clone().into();
+            let r = if newpath.ends_with("/") {
+                state.files.create_folder(newpath)
+            } else {
+                state.files.create_file(newpath)
+            };
+
+            if let Err(e) = r {
                 return Task::done(Message::SetMessage(e.to_string()));
             }
             state.files.create_flag = false;
+            return Task::done(Message::FilesPaneMode(FilesMode::Normal));
         }
         CreatePathName(s) => state.new_folder_name = s,
 
