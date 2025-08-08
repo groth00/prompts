@@ -1,7 +1,6 @@
 use std::{
     collections::VecDeque,
     fmt::{self, Display},
-    fs,
     io::Cursor,
     path::PathBuf,
     sync::Arc,
@@ -50,15 +49,11 @@ use crate::{
         PromptKind, SqliteError, Template, delete_prompt, fetch_prompts, save_prompt,
         update_prompt, update_prompt_name,
     },
-    files::{
-        Entry, EntryKind, FilesState, entries, init_visible, selected_entry, selected_entry_mut,
-        update_visible, update_visible2,
-    },
+    files2::{EntryKind, FileTree},
     image_metadata::extract_image_metadata,
     nai::{self, ImageGenRequest, ImageGenerationError, ImageShape, Point, Position, Requester},
 };
 
-const FILE_EXTENSIONS: [&'static str; 3] = ["jpeg", "jpg", "png"];
 const MAX_VISIBLE: usize = 40;
 
 pub struct State {
@@ -91,12 +86,10 @@ pub struct State {
     current_seed: Option<u64>,
     num_generate: String,
 
-    files: FilesState,
+    files: FileTree,
     files_mode: FilesMode,
     new_folder_name: String,
     cache: FastHashMap<PathBuf, Handle>,
-    /// when selecting file entries in FilesMode::Batch
-    temp: Vec<(Vec<usize>, PathBuf)>,
 
     images: VecDeque<Vec<u8>>,
     thumbnails: VecDeque<Handle>,
@@ -202,10 +195,9 @@ impl Default for State {
             num_generate: 1.to_string(),
 
             files_mode: FilesMode::Normal,
-            files: FilesState::new(PROJECT_DIRS.data_dir()),
+            files: FileTree::new(PROJECT_DIRS.data_dir()),
             new_folder_name: String::new(),
             cache: FastHashMap::default(),
-            temp: Vec::new(),
 
             images: VecDeque::new(),
             thumbnails: VecDeque::new(),
@@ -326,7 +318,7 @@ pub enum Message {
     Pause,
     Resume,
     Cancel(u64),
-    Create((u64, ImageGenRequest)),
+    CreateImage((u64, ImageGenRequest)),
 
     // from channel
     Channel(ChannelEvent),
@@ -352,8 +344,7 @@ pub enum Message {
     DeleteImageHistory,
 
     // files pane
-    Entries((Vec<usize>, Vec<Entry>)),
-    ToggleExpand(Vec<usize>),
+    ToggleExpand,
     Refresh,
     RefreshSelected,
     GotoStart,
@@ -366,8 +357,8 @@ pub enum Message {
     DeleteBatch,
     FilesPaneMode(FilesMode),
     SelectEntry,
-    CreateFolder,
-    FolderName(String),
+    CreatePath,
+    CreatePathName(String),
 }
 
 pub fn update(state: &mut State, msg: Message) -> Task<Message> {
@@ -375,9 +366,8 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
     match msg {
         Dummy => (),
         Event(e) => return handle_event(state, e),
-        // BUG: move doesn't reflect at all
-        // delete doesn't reflect on subdirectories
-        // something is causing the entries to have relative paths, i don't know what it is
+
+        // TODO: granular visible entry updates
         FsEvent(ev) => {
             // assume only 1 entry ever appears in e.paths
             if ev.paths[0]
@@ -388,21 +378,6 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 return Task::none();
             }
 
-            println!("{:?}", ev);
-            let trail = trail_from_path(&state.files, &ev.paths[0]);
-            println!("trail: {:?}", trail);
-
-            // NOTE: this check causes too many issues
-            // trail_from_path defaults to [0], which will not trigger a refresh
-            // if the 0th entry happens to be a closed directory
-
-            // if let Some(entry) = selected_entry(&state.files.entries, &trail) {
-            //     if entry.kind == EntryKind::Folder && !entry.expanded() {
-            //         return Task::none();
-            //     }
-            // }
-
-            // TODO: granular update visible at end of each branch
             match ev.kind {
                 EventKind::Create(kind) => {
                     let new_entry_kind = if kind == CreateKind::Folder {
@@ -410,63 +385,23 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                     } else {
                         EntryKind::File
                     };
-
-                    let new_entry = Entry {
-                        path: ev.paths[0].clone(),
-                        kind: new_entry_kind,
-                        flags: 0,
-                        children: None,
-                    };
-                    if trail.len() == 1 {
-                        state.files.entries.push(new_entry);
-                        state.files.entries.sort();
-                    } else {
-                        if let Some(entry) =
-                            selected_entry_mut(&mut state.files.entries, &trail[..trail.len() - 1])
-                        {
-                            match &mut entry.children {
-                                Some(c) => c.push(new_entry),
-                                None => entry.children = Some(vec![new_entry]),
-                            }
-                            entry.children.as_mut().unwrap().sort();
-                        }
-                    }
+                    let parent = todo!();
+                    state.files.add(ev.paths[0].clone(), parent, new_entry_kind);
                 }
                 EventKind::Remove(..) => {
-                    if trail.len() == 1 {
-                        if let Some(i) = state
-                            .files
-                            .entries
-                            .iter()
-                            .position(|entry| entry.path == ev.paths[0])
-                        {
-                            state.files.entries.remove(i);
-                        }
-                    } else {
-                        if let Some(entry) =
-                            selected_entry_mut(&mut state.files.entries, &trail[..trail.len() - 1])
-                        {
-                            if let Some(children) = &mut entry.children {
-                                if let Some(index) =
-                                    children.iter().position(|entry| entry.path == ev.paths[0])
-                                {
-                                    children.remove(index);
-                                }
-                            }
-                        }
-                    }
+                    // TODO: find the parent entry based off of the fsevent path
+
+                    let id = todo!();
+                    state.files.delete(id);
                 }
                 EventKind::Modify(ModifyKind::Name(..)) => {
                     if !state.notify_move.started {
                         state.notify_move.started = !state.notify_move.started;
-                        // remove from old parent
-                        if let Some(entry) =
-                            selected_entry_mut(&mut state.files.entries, &trail[..trail.len() - 1])
-                        {
+
+                        let id = todo!();
+                        if let Some(entry) = state.files.get_entry_mut(id) {
                             if let Some(children) = &mut entry.children {
-                                if let Some(i) =
-                                    children.iter().position(|entry| entry.path == ev.paths[0])
-                                {
+                                if let Some(i) = children.iter().position(|entry| *entry == id) {
                                     let removed = children.remove(i);
                                     state.notify_move.entry = Some(removed);
                                 }
@@ -474,14 +409,12 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                         }
                     } else {
                         state.notify_move.started = !state.notify_move.started;
-                        // add to new parent
-                        if let Some(entry) =
-                            selected_entry_mut(&mut state.files.entries, &trail[..trail.len() - 1])
-                        {
+
+                        let id = todo!();
+                        if let Some(entry) = state.files.get_entry_mut(id) {
                             if let Some(children) = &mut entry.children {
                                 if let Some(entry) = state.notify_move.entry.take() {
                                     children.push(entry);
-                                    children.sort();
                                 }
                             }
                         }
@@ -490,10 +423,8 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 _ => (),
             }
 
-            state.files.visible.clear();
-            init_visible(&state.files.entries, &mut state.files.visible, 0, vec![]);
+            FileTree::visit_root(&state.files.entries, &mut state.files.visible);
         }
-
         SetMessage(s) => state.message = Some(s),
         SelectedTheme(theme) => state.selected_theme = theme,
 
@@ -568,7 +499,7 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                     return Task::perform(
                         async move {
                             for i in seeds {
-                                let _ = tx.send(Message::Create((i, req.clone()))).await;
+                                let _ = tx.send(Message::CreateImage((i, req.clone()))).await;
                             }
                         },
                         // generate_many(semaphore, client, req, seeds), |results| {
@@ -634,262 +565,70 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 );
             }
         }
-        Create(..) => (),
+        CreateImage(..) => (),
 
         // files
-        Entries((path, mut entries)) => {
-            if let Some(entry) = selected_entry_mut(&mut state.files.entries, &path) {
-                entries.sort();
-                entry.children = Some(entries);
-                entry.set_expanded();
-            }
-            update_visible(&mut state.files);
-        }
-        ToggleExpand(path) => {
-            if let Some(entry) = selected_entry_mut(&mut state.files.entries, &path) {
-                match entry.kind {
-                    EntryKind::Folder => {
-                        if !entry.visited() {
-                            entry.set_visited();
-                            return Task::done(Message::Entries((
-                                path.clone(),
-                                entries(&entry.path),
-                            )));
-                        }
-                        entry.toggle_expanded();
-                        update_visible(&mut state.files);
-                    }
-                    EntryKind::File => {
-                        if let Some(_) = entry
-                            .path
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .filter(|ext| FILE_EXTENSIONS.contains(&ext))
-                        {
-                            if !state.cache.contains_key(&entry.path) {
-                                let handle = Handle::from_path(&entry.path);
-                                state.cache.insert(entry.path.clone(), handle);
-                            } else {
-                                state.cache.remove(&entry.path);
-                            }
-                        }
-                    }
-                }
-            }
-            return Task::none();
+        ToggleExpand => {
+            state.files.enter(&mut state.cache);
         }
         Refresh => {
-            state.files = FilesState::new(".");
+            state.files = FileTree::new(PROJECT_DIRS.data_dir());
         }
         RefreshSelected => {
-            if let Some(entry) = selected_entry_mut(&mut state.files.entries, &state.files.selected)
-            {
-                if entry.kind == EntryKind::Folder && entry.visited() {
-                    if let Some(children) = entry.children.as_mut() {
-                        let mut entries = entries(&entry.path);
-                        entries.sort();
-                        *children = entries;
-                    }
-                } else if entry.kind == EntryKind::File {
-                    if state.files.selected.len() > 1 {
-                        state.files.selected.pop();
-                        return Task::done(Message::RefreshSelected);
-                    }
-                }
-                update_visible(&mut state.files);
-            }
+            state.files.update_children(state.files.selected);
         }
         GotoStart => {
-            state.files.selected = vec![0];
+            state.files.select_start();
         }
         GotoEnd => {
-            state.files.selected = vec![state.files.entries.len() - 1];
+            state.files.select_end();
         }
         NavigateUp => {
-            if let Ok(cd) = std::env::current_dir() {
-                if let Some(parent) = cd.parent() {
-                    state.files = FilesState::new(parent);
-                }
-            }
+            state.files.cd_parent();
         }
         SetRoot => {
-            if let Some(entry) = selected_entry(&state.files.entries, &state.files.selected) {
-                if entry.kind == EntryKind::Folder {
-                    state.files = FilesState::new(&entry.path);
-                }
-            }
+            state.files.cd_selected();
         }
         ImportPrompt(seed, base, characters) => {
             set_prompt_characters(state, base, characters);
             state.current_seed = Some(seed);
         }
-        Delete => return delete_file(state),
+        Delete => {
+            if let Err(e) = state.files.delete(state.files.selected) {
+                return Task::done(Message::SetMessage(e.to_string()));
+            }
+        }
         MoveBatch => {
-            let mut zombies: Vec<Entry> = Vec::with_capacity(state.temp.len());
-
-            // for each selected entry, find and remove it from its parent's children vec
-            for (parent_path, entry_pathbuf) in state.temp.drain(..) {
-                if let Some(parent) = selected_entry_mut(&mut state.files.entries, &parent_path) {
-                    if let Some(children) = &mut parent.children {
-                        if let Some(pos) = children.iter().position(|e| e.path == *entry_pathbuf) {
-                            zombies.push(children.remove(pos));
-                        }
-                    }
-                }
+            if let Err(e) = state.files.batch_move() {
+                return Task::done(Message::SetMessage(e.to_string()));
             }
-
-            if let Some(new_parent) =
-                selected_entry_mut(&mut state.files.entries, &state.files.selected)
-            {
-                for zo in &mut zombies {
-                    zo.clear_selected(); // remove UI text style
-
-                    if let Some(name) = &zo.path.file_name() {
-                        let new_name = new_parent.path.join(name);
-
-                        if let Err(e) = fs::rename(&zo.path, &new_name) {
-                            eprintln!("move {:?} to {:?}: {}", &zo.path, &new_name, e);
-                        } else {
-                            println!("move {:?} to {:?}", &zo.path, &new_name);
-                        }
-
-                        // update the path to reflect new parent
-                        zo.path = new_name;
-                    }
-                }
-                match &mut new_parent.children {
-                    Some(children) => children.extend_from_slice(&zombies),
-                    None => new_parent.children = Some(zombies),
-                }
-                new_parent.children.as_mut().unwrap().sort();
-            }
-            state.files.visible.clear();
-            init_visible(&state.files.entries, &mut state.files.visible, 0, vec![]);
         }
         DeleteBatch => {
-            println!("DELETE BATCH: {:?}", &state.temp);
-            for (parent_path, entry_pathbuf) in state.temp.drain(..) {
-                let removed = if parent_path.len() == 1 {
-                    state
-                        .files
-                        .entries
-                        .iter()
-                        .position(|e| e.path == entry_pathbuf)
-                        .map_or(None, |i| Some(state.files.entries.remove(i)))
-                } else {
-                    selected_entry_mut(&mut state.files.entries, &parent_path).map_or(None, |e| {
-                        e.children.as_mut().map_or(None, |c| {
-                            c.iter()
-                                .position(|e| e.path == entry_pathbuf)
-                                .map_or(None, |i| Some(c.remove(i)))
-                        })
-                    })
-                };
-
-                if let Some(removed) = removed {
-                    if removed.kind == EntryKind::File {
-                        if let Err(e) = trash::delete(&removed.path) {
-                            return Task::done(Message::SetMessage(e.to_string()));
-                        }
-
-                        // evict image from memory (if it was opened)
-                        state.cache.remove(&removed.path);
-                    }
-                }
+            if let Err(e) = state.files.batch_delete() {
+                return Task::done(Message::SetMessage(e.to_string()));
             }
-
-            state.files.visible.clear();
-            init_visible(&state.files.entries, &mut state.files.visible, 0, vec![]);
-            return Task::done(Message::SetMessage("deleted files".into()));
         }
         FilesPaneMode(mode) => {
             state.files_mode = mode;
 
             if mode == FilesMode::Normal {
-                state.files.clear_create_folder();
-                for (path, _) in &state.temp {
-                    if let Some(entry) = selected_entry_mut(&mut state.files.entries, &path) {
-                        if let Some(children) = &mut entry.children {
-                            for c in children {
-                                c.clear_selected();
-                            }
-                        } else {
-                            entry.clear_selected();
-                        }
-                    }
-                }
+                state.files.create_flag = false;
+                state.files.clear_marked();
             }
-            if mode == FilesMode::CreateFolder {
-                state.files.set_create_folder();
+            if mode == FilesMode::Create {
+                state.files.create_flag = true;
             }
         }
         SelectEntry => {
-            if let Some(entry) = selected_entry_mut(&mut state.files.entries, &state.files.selected)
-            {
-                let trail = if state.files.selected.len() == 1 {
-                    state.files.selected.clone()
-                } else {
-                    state.files.selected[..state.files.selected.len() - 1].to_vec()
-                };
-
-                entry.toggle_selected();
-                state.temp.push((trail, entry.path.clone()));
-            }
+            state.files.mark();
         }
-        CreateFolder => {
-            state.files.clear_create_folder();
-            if state.new_folder_name.is_empty() {
-                return Task::done(Message::SetMessage("need non-empty folder name".into()));
+        CreatePath => {
+            if let Err(e) = state.files.create(state.new_folder_name.clone().into()) {
+                return Task::done(Message::SetMessage(e.to_string()));
             }
-
-            let new_path = PathBuf::from(&state.new_folder_name);
-            if let Err(e) = fs::create_dir(&new_path) {
-                return Task::done(Message::SetMessage(format!("failed to create dir: {}", e)));
-            }
-            let new_entry = Entry {
-                path: new_path,
-                kind: EntryKind::Folder,
-                flags: 0,
-                children: Some(vec![]),
-            };
-            let selected_path_len = state.files.selected.len();
-
-            if let Some(entry) = selected_entry_mut(&mut state.files.entries, &state.files.selected)
-            {
-                match entry.kind {
-                    EntryKind::File => {
-                        if selected_path_len == 1 {
-                            state.files.entries.push(new_entry);
-                        } else {
-                            let selected_parent = &state.files.selected[..selected_path_len - 1];
-                            if let Some(entry) =
-                                selected_entry_mut(&mut state.files.entries, selected_parent)
-                            {
-                                entry
-                                    .children
-                                    .as_mut()
-                                    .expect("parent of file is not a directory")
-                                    .push(new_entry);
-                                entry.children.as_mut().unwrap().sort();
-                            }
-                        }
-                    }
-                    EntryKind::Folder => {
-                        if let Some(children) = &mut entry.children {
-                            children.push(new_entry);
-                            children.sort();
-                        }
-                    }
-                }
-                if selected_path_len == 1 {
-                    init_visible(&state.files.entries, &mut state.files.visible, 0, vec![]);
-                } else {
-                    update_visible(&mut state.files);
-                }
-            }
-            return Task::done(Message::SetMessage("created dir".into()));
+            state.files.create_flag = false;
         }
-        FolderName(s) => state.new_folder_name = s,
+        CreatePathName(s) => state.new_folder_name = s,
 
         // prompt storage
         BasePromptSelected(s) => {
@@ -1133,13 +872,11 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
                 .files
                 .visible
                 .iter()
-                .position(|ve| &ve.path == &state.files.selected);
+                .position(|ve| &ve.id == &state.files.selected);
 
             match state.files_mode {
                 FilesMode::Normal => match e {
-                    keyboard::Event::KeyPressed {
-                        ref key, modifiers, ..
-                    } => {
+                    keyboard::Event::KeyPressed { ref key, .. } => {
                         if key.as_ref() == Key::Named(Named::Backspace) {
                             return Task::done(Message::NavigateUp);
                         }
@@ -1147,9 +884,7 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
                             return Task::done(Message::SetRoot);
                         }
                         if key.as_ref() == Key::Character("i") {
-                            if let Some(entry) =
-                                selected_entry(&state.files.entries, &state.files.selected)
-                            {
+                            if let Some(entry) = state.files.get_entry(state.files.selected) {
                                 if entry.kind == EntryKind::File
                                     && entry
                                         .path
@@ -1172,8 +907,8 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
                         if key.as_ref() == Key::Character("b") {
                             return Task::done(Message::FilesPaneMode(FilesMode::Batch));
                         }
-                        if key.as_ref() == Key::Character("a") && modifiers.shift() {
-                            return Task::done(Message::FilesPaneMode(FilesMode::CreateFolder));
+                        if key.as_ref() == Key::Character("a") {
+                            return Task::done(Message::FilesPaneMode(FilesMode::Create));
                         }
                     }
                     _ => (),
@@ -1205,7 +940,7 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
                     Key::Named(Named::ArrowUp) | Key::Character("k") => {
                         if let Some(i) = current_index {
                             if i > 0 {
-                                state.files.selected = state.files.visible[i - 1].path.clone();
+                                state.files.selected = state.files.visible[i - 1].id;
                                 state.files.view_offset = state.files.view_offset.saturating_sub(1);
                             }
                         }
@@ -1213,21 +948,17 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
                     Key::Named(Named::ArrowDown) | Key::Character("j") => {
                         if let Some(i) = current_index {
                             if i + 1 < state.files.visible.len() {
-                                state.files.selected = state.files.visible[i + 1].path.clone();
+                                state.files.selected = state.files.visible[i + 1].id;
                                 if i + 1 >= state.files.view_offset + MAX_VISIBLE {
                                     state.files.view_offset += 1;
                                 }
                             }
                         } else if !state.files.visible.is_empty() {
-                            state.files.selected = state.files.visible[0].path.clone();
+                            state.files.selected = state.files.visible[0].id;
                         }
                     }
                     Key::Named(Named::Enter) => {
-                        if let Some(i) = current_index {
-                            return Task::done(Message::ToggleExpand(
-                                state.files.visible[i].path.clone(),
-                            ));
-                        }
+                        return Task::done(Message::ToggleExpand);
                     }
                     Key::Character("g") => {
                         if modifiers.shift() {
@@ -1239,8 +970,9 @@ fn handle_event_files(state: &mut State, e: Event) -> Task<Message> {
                     Key::Character("r") => {
                         if modifiers.shift() {
                             return Task::done(Message::Refresh);
+                        } else {
+                            return Task::done(Message::RefreshSelected);
                         }
-                        return Task::done(Message::RefreshSelected);
                     }
 
                     _ => (),
@@ -1364,7 +1096,7 @@ fn view_files(state: &State) -> Element<Message> {
         .iter()
         .enumerate()
         .fold(Column::new(), |col, (_i, e)| {
-            let entry = selected_entry(&state.files.entries, &e.path).unwrap();
+            let entry = state.files.get_entry(e.id).unwrap();
 
             let label = match entry.kind {
                 EntryKind::Folder => {
@@ -1374,7 +1106,7 @@ fn view_files(state: &State) -> Element<Message> {
                         entry.path.file_name().unwrap().to_string_lossy()
                     )
                 }
-                EntryKind::File => {
+                _ => {
                     format!(
                         "{}F  {}",
                         "  ".repeat(e.depth),
@@ -1383,8 +1115,8 @@ fn view_files(state: &State) -> Element<Message> {
                 }
             };
 
-            let is_current = state.files.selected == e.path;
-            let is_selected = entry.selected();
+            let is_current = state.files.selected == e.id;
+            let is_selected = entry.marked;
 
             let style = if is_current {
                 text::primary
@@ -1399,11 +1131,11 @@ fn view_files(state: &State) -> Element<Message> {
         .padding(4)
         .spacing(2);
 
-    col = col.push_maybe(if state.files.create_folder() {
+    col = col.push_maybe(if state.files.create_flag {
         Some(
             text_input("new folder name", &state.new_folder_name)
-                .on_input(Message::FolderName)
-                .on_submit(Message::CreateFolder),
+                .on_input(Message::CreatePathName)
+                .on_submit(Message::CreatePath),
         )
     } else {
         None
@@ -1596,8 +1328,10 @@ fn view_prompts(state: &State) -> Element<Message> {
 }
 
 fn view_image(state: &State) -> Element<Message> {
-    let file_pane_image: Option<Element<Message>> =
-        selected_entry(&state.files.entries, &state.files.selected).map_or(None, |e| {
+    let file_pane_image: Option<Element<Message>> = state
+        .files
+        .get_entry(state.files.selected)
+        .map_or(None, |e| {
             state
                 .cache
                 .get(&e.path)
@@ -1658,60 +1392,6 @@ fn view_controls<'a>(pane: pane_grid::Pane, is_maximized: bool) -> Element<'a, M
     row.into()
 }
 
-fn trail_from_path<P: AsRef<std::path::Path>>(state: &FilesState, p: P) -> Vec<usize> {
-    if let Ok(trimmed) = p.as_ref().strip_prefix(PROJECT_DIRS.data_dir()) {
-        println!("checking {:?}", trimmed);
-        let parts = trimmed
-            .to_str()
-            .unwrap_or_default()
-            .split("/")
-            .collect::<Vec<_>>();
-        if parts.len() == 1 {
-            return vec![0];
-        } else {
-            println!("parts: {:?}", parts);
-            let mut trail = vec![];
-
-            let mut root = &state.entries;
-            for p in parts {
-                println!("{:?}", root);
-                let index = root.iter().position(|e| {
-                    println!(
-                        "{:?} -> {:?}",
-                        &e.path,
-                        &e.path.strip_prefix(PROJECT_DIRS.data_dir())
-                    );
-                    if let Ok(entry_path) = e.path.strip_prefix(PROJECT_DIRS.data_dir()) {
-                        if let Some(s) = entry_path.to_str() {
-                            return s == p;
-                        }
-                    }
-                    false
-                });
-                if let Some(i) = index {
-                    trail.push(i);
-                    if let Some(children) = &root[i].children {
-                        root = children;
-                    } else {
-                        // the entry was not visited so there are no children
-                        // or the parameter is a path that doesn't exist
-
-                        // push placeholder so we are at the correct depth
-                        trail.push(0);
-                        return trail;
-                    }
-                } else {
-                    // push placeholder so we are at the correct depth
-                    trail.push(0);
-                    return trail;
-                }
-            }
-            return trail;
-        }
-    }
-    Vec::new()
-}
-
 fn setup_request(state: &mut State) -> ImageGenRequest {
     let mut req = ImageGenRequest::default();
 
@@ -1742,44 +1422,6 @@ fn setup_request(state: &mut State) -> ImageGenRequest {
         req.use_coords(false);
     }
     req
-}
-
-fn delete_file(state: &mut State) -> Task<Message> {
-    if let Some(entry) = selected_entry(&state.files.entries, &state.files.selected) {
-        if entry.kind == EntryKind::File {
-            let remove_path = entry.path.clone();
-
-            if let Err(e) = trash::delete(&remove_path) {
-                return Task::done(Message::SetMessage(e.to_string()));
-            }
-
-            // evict image handle from memory (if it was opened)
-            state.cache.remove(&remove_path);
-
-            // remove from internal entries & update visible entries
-            if state.files.selected.len() == 1 {
-                state.files.entries.remove(state.files.selected[0]);
-                state.files.visible.clear();
-                init_visible(&state.files.entries, &mut state.files.visible, 0, vec![]);
-            } else {
-                // entries don't have a reference to their parents; pop state.selected to go up
-                state.files.selected.pop();
-                if let Some(entry) =
-                    selected_entry_mut(&mut state.files.entries, &state.files.selected)
-                {
-                    if let Some(children) = &mut entry.children {
-                        children
-                            .iter()
-                            .position(|e| e.path == remove_path)
-                            .and_then(|i| Some(children.remove(i)));
-                    }
-                }
-                update_visible(&mut state.files);
-            }
-            return Task::done(Message::SetMessage(format!("deleted {:?}", remove_path)));
-        }
-    }
-    Task::none()
 }
 
 fn set_prompt_characters(state: &mut State, base: String, characters: Vec<String>) {
@@ -1919,7 +1561,7 @@ fn channel_subscribe() -> impl Stream<Item = ChannelEvent> {
                                 in_flight.insert(seed, jh);
                             }
                         }
-                        Message::Create((seed, mut req)) => {
+                        Message::CreateImage((seed, mut req)) => {
                             if paused {
                                 buf.push_back((seed, req));
                             } else {
@@ -2009,7 +1651,7 @@ struct NotifyMove {
     // if false we have the path under the old parent
     // if true we have the path under the new parent
     started: bool,
-    entry: Option<Entry>,
+    entry: Option<usize>,
 }
 
 struct TaskState {
@@ -2062,7 +1704,7 @@ pub enum FilesMode {
     #[default]
     Normal,
     Batch,
-    CreateFolder,
+    Create,
 }
 
 impl Display for FilesMode {
@@ -2071,7 +1713,7 @@ impl Display for FilesMode {
         match self {
             Normal => write!(f, "Normal"),
             Batch => write!(f, "Batch"),
-            CreateFolder => write!(f, "CreateFolder"),
+            Create => write!(f, "CreateFolder"),
         }
     }
 }
@@ -2176,34 +1818,5 @@ mod style {
             },
             ..Default::default()
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::{PROJECT_DIRS, files::FilesState, ui::trail_from_path};
-
-    #[test]
-    fn t_trail_from_path_l1() {
-        let state = FilesState::new(PROJECT_DIRS.data_dir());
-
-        let trail = trail_from_path(&state, PROJECT_DIRS.data_dir().join("prompts.db"));
-        assert_eq!(trail, vec![1]);
-    }
-
-    #[test]
-    fn t_trail_from_path_l2() {
-        let state = FilesState::new(PROJECT_DIRS.data_dir());
-
-        let trail = trail_from_path(&state, PROJECT_DIRS.data_dir().join("output/foo"));
-        assert_eq!(trail, vec![0, 0]);
-    }
-
-    #[test]
-    fn t_trail_from_path_l3() {
-        let state = FilesState::new(PROJECT_DIRS.data_dir());
-
-        let trail = trail_from_path(&state, PROJECT_DIRS.data_dir().join("output/subdir/bar"));
-        assert_eq!(trail, vec![0, 1, 0]);
     }
 }
