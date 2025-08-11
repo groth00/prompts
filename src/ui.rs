@@ -32,10 +32,6 @@ use iced::{
     window,
 };
 use image::{GenericImageView, ImageReader};
-use notify::{
-    EventKind,
-    event::{CreateKind, ModifyKind},
-};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rand::{Rng, distr::Uniform, rngs::ThreadRng};
@@ -57,7 +53,6 @@ use crate::{
 pub struct State {
     task_state: TaskState,
     task_ids: Vec<u64>,
-    notify_move: NotifyMove,
 
     pub selected_theme: Theme,
     last_key: Option<(Key, keyboard::Modifiers)>,
@@ -141,10 +136,6 @@ impl Default for State {
                 status: ChannelStatus::NotReady,
             },
             task_ids: Vec::new(),
-            notify_move: NotifyMove {
-                started: false,
-                entry: None,
-            },
 
             selected_theme: Theme::CatppuccinMacchiato,
             last_key: None,
@@ -363,46 +354,12 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
         Dummy => (),
         Event(e) => return handle_event(state, e),
 
-        // TODO: granular visible entry updates
         FsEvent(ev) => {
-            // assume only 1 entry ever appears in e.paths
-            if ev.paths[0]
-                .as_os_str()
-                .to_str()
-                .map_or(false, |s| s.contains(".DS_Store"))
-            {
-                return Task::none();
-            }
-
-            match ev.kind {
-                EventKind::Create(kind) => {
-                    let new_entry_kind = if kind == CreateKind::Folder {
-                        EntryKind::Folder
-                    } else {
-                        EntryKind::File
-                    };
-                    todo!();
-                }
-                EventKind::Remove(..) => {
-                    // TODO: find the parent entry based off of the fsevent path
-
-                    todo!();
-                }
-                EventKind::Modify(ModifyKind::Name(..)) => {
-                    if !state.notify_move.started {
-                        state.notify_move.started = !state.notify_move.started;
-
-                        todo!();
-                    } else {
-                        state.notify_move.started = !state.notify_move.started;
-
-                        todo!();
-                    }
-                }
-                _ => (),
-            }
-
-            // TODO: update visible
+            let msg = match state.files.handle_notify(ev) {
+                Err(e) => e.to_string(),
+                Ok(_) => "handled notify event".into(),
+            };
+            return Task::done(Message::SetMessage(msg));
         }
         SetMessage(s) => state.message = Some(s),
         SelectedTheme(theme) => state.selected_theme = theme,
@@ -1614,14 +1571,6 @@ fn channel_fsevent() -> impl Stream<Item = notify::Event> {
             }
         }
     })
-}
-
-struct NotifyMove {
-    // modification events come in pairs,
-    // if false we have the path under the old parent
-    // if true we have the path under the new parent
-    started: bool,
-    entry: Option<usize>,
 }
 
 struct TaskState {

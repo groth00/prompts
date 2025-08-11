@@ -1,4 +1,11 @@
 2025-08-11
+- Added
+update file tree from external events via notify crate + iced subscription
+
+- Changed
+file tree changed to slotmap implementation instead of parentless entries +
+trail
+
 - Fixed
 corrected visible entries after batch delete, batch move, create
 can create a new entry when the selected entry is a file

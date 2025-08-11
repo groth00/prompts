@@ -67,7 +67,7 @@ fn main() -> iced::Result {
                     Subscription::batch([
                         event_subscribe(state),
                         run_channel_subscription(),
-                        // run_fsevent_subscription(),
+                        run_fsevent_subscription(),
                     ])
                 })
                 .theme(|state| state.selected_theme.clone())

@@ -36,6 +36,20 @@ pub struct Entry {
     pub marked: bool,
 }
 
+impl Entry {
+    fn clear_children(&mut self) {
+        self.visited = false;
+        self.children.clear();
+    }
+
+    fn clear_all(&mut self) {
+        self.visited = false;
+        self.expanded = false;
+
+        self.children.clear();
+    }
+}
+
 #[derive(Debug)]
 pub struct VisibleEntry {
     pub id: EntryId,
@@ -54,7 +68,13 @@ pub struct FileTree {
 
     pub cache: FastHashMap<PathBuf, Handle>,
 
+    // if the user is currently typing a new file/folder to create in the UI
     pub create_flag: bool,
+
+    // file rename events come in pairs: old path then new path
+    // track which path we are receiving
+    pub notify_modify: bool,
+    pub modify_from: Option<PathBuf>,
 }
 
 impl FileTree {
@@ -84,6 +104,9 @@ impl FileTree {
             cache: FastHashMap::default(),
 
             create_flag: false,
+
+            notify_modify: false,
+            modify_from: None,
         };
 
         if let Ok(mut read_dir) = fs::read_dir(dir.as_ref()) {
@@ -213,13 +236,7 @@ impl FileTree {
         self.add(id, newpath, entry_kind);
 
         // reset visible entries for parent
-        self.selected = entry_id;
-        self.enter();
-        self.entries[entry_id].visited = false;
-        self.entries[entry_id].children.clear();
-        self.enter();
-
-        // self.selected = new_id;
+        self.reset_visible(entry_id);
 
         Ok(())
     }
@@ -407,6 +424,14 @@ impl FileTree {
         }
     }
 
+    fn reset_visible(&mut self, id: EntryId) {
+        self.selected = id;
+        self.enter();
+        self.entries[id].visited = false;
+        self.entries[id].children.clear();
+        self.enter();
+    }
+
     pub fn mark(&mut self) {
         let id = self.selected;
         self.entries[id].marked = !self.entries[id].marked;
@@ -496,6 +521,170 @@ impl FileTree {
             (EntryKind::File, EntryKind::Folder) => Ordering::Greater,
             _ => a.path.cmp(&b.path),
         }
+    }
+}
+
+impl FileTree {
+    pub fn handle_notify(&mut self, ev: notify::Event) -> Result<(), io::Error> {
+        use io::{Error, ErrorKind};
+        use notify::{
+            EventKind,
+            event::{CreateKind, ModifyKind, RemoveKind, RenameMode},
+        };
+
+        // NOTE: assume exactly 1 entry in ev.paths
+        let ev_path = &ev.paths[0];
+
+        // ignore .DS_Store events
+        if ev_path
+            .as_os_str()
+            .to_str()
+            .map_or(false, |s| s.ends_with(".DS_Store"))
+        {
+            return Ok(());
+        }
+
+        match ev.kind {
+            EventKind::Create(kind) => {
+                let entry_kind = match kind {
+                    CreateKind::File => EntryKind::File,
+                    CreateKind::Folder => EntryKind::Folder,
+                    _ => {
+                        println!("skipping create: {:?}", &ev);
+                        return Err(Error::new(ErrorKind::Unsupported, "unknown create kind"));
+                    }
+                };
+
+                // the create event gives us the new filename; we need to check if the parent path
+                // exists in the slotmap
+                if let Some(parent_path) = ev_path.parent() {
+                    let parent = self
+                        .entries
+                        .iter()
+                        .find(|(_id, entry)| entry.path == parent_path);
+
+                    if let Some((id, entry)) = parent {
+                        let expanded = entry.expanded;
+
+                        self.add(id, ev_path.clone(), entry_kind);
+
+                        if expanded {
+                            self.reset_visible(id);
+                        } else {
+                            self.entries[id].clear_children();
+                        }
+                    }
+                }
+            }
+            EventKind::Remove(kind) => {
+                let _entry_kind = match kind {
+                    RemoveKind::File => EntryKind::File,
+                    RemoveKind::Folder => EntryKind::Folder,
+                    _ => {
+                        println!("skipping remove: {:?}", &ev);
+                        return Err(Error::new(ErrorKind::Unsupported, "unknown remove kind"));
+                    }
+                };
+
+                let maybe_entry = self
+                    .entries
+                    .iter()
+                    .find(|(_id, entry)| entry.path == *ev_path);
+
+                if let Some((id, entry)) = maybe_entry {
+                    if let Some(pid) = entry.parent {
+                        let expanded = self.entries[pid].expanded;
+
+                        if id == self.root {
+                            panic!("user deleted root of filetree outside of app");
+                        }
+
+                        self.entries[pid].children.retain(|cid| *cid != id);
+                        self._delete_recursive(id);
+
+                        // the cursor may be on the entry that was externally deleted
+                        if self.entries.get(self.selected).is_none() {
+                            let idx = self
+                                .visible
+                                .iter()
+                                .position(|i| i.id == self.selected)
+                                .unwrap_or(1);
+                            self.selected = self.visible[idx - 1].id;
+                        }
+
+                        self.reset_visible(pid);
+                    }
+                }
+            }
+            // the FsEvent, kqueue, and PollWatcher backends all produce different events
+            // unforunately
+            // none of them emit RenameMode::From and RenameMode::To when using mv
+            // this also causes us to miss pairs of rename events where one half involves a
+            // directory that is not watched (parents/ancestors)
+            // BUG: visible entries don't update when moving from higher to lower depth
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)) => {
+                if !self.notify_modify {
+                    println!("modify1: {:?}", &ev.paths);
+                    self.notify_modify = true;
+                    self.modify_from = Some(ev_path.clone());
+                } else {
+                    println!("modify2: {:?}", &ev.paths);
+                    self.notify_modify = false;
+                    let modify_to = ev_path;
+
+                    let (old_entry, new_parent) = if let Some(path_from) = &self.modify_from {
+                        let old_entry = self
+                            .entries
+                            .iter()
+                            .find(|(_id, entry)| entry.path == *path_from);
+
+                        let new_parent = modify_to.parent().map_or(None, |parent_path| {
+                            self.entries
+                                .iter()
+                                .find(|(_id, entry)| entry.path == parent_path)
+                        });
+
+                        (old_entry, new_parent)
+                    } else {
+                        println!("skipping modify: {:?}", &ev);
+                        return Err(Error::new(
+                            ErrorKind::InvalidInput,
+                            "invalid old or new parent",
+                        ));
+                    };
+
+                    // (Some, None) variant matches when entry was moved outside of file tree
+                    // but as stated above we can't detect such pairs of events
+                    match (old_entry, new_parent) {
+                        (Some((old_id, old_entry)), Some((new_pid, _new_parent))) => {
+                            if let Some(old_pid) = old_entry.parent {
+                                if old_id == self.root {
+                                    panic!("user moved root of filetree outside of app");
+                                }
+
+                                self.entries[old_pid].children.retain(|cid| *cid != old_id);
+                                self.entries[old_id].parent = Some(new_pid);
+                                self.entries[old_id].path = modify_to.clone();
+
+                                self.reset_visible(old_id);
+                                self.reset_visible(new_pid);
+                            }
+                        }
+                        // NOTE: we don't capture events from outside the tree into the tree
+                        // as notify only watches a directory (recursively if specified)
+                        // unless we set up multiple watchers
+                        _ => {
+                            println!("skip modify: {:?}", &ev);
+                        }
+                    }
+
+                    self.modify_from = None;
+                }
+            }
+            _ => (),
+        }
+
+        Ok(())
     }
 }
 
