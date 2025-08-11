@@ -1,3 +1,42 @@
+2025-08-11
+- Fixed
+corrected visible entries after batch delete, batch move, create
+can create a new entry when the selected entry is a file
+
+
+2025-08-07
+Known Issues
+operations in file pane may result in incorrect visible entries (underlying fs
+operations are ok)
+- occasionally have to manually refresh, mostly on move_batch, delete_batch,
+delete
+
+- Added
+exit create/batch FilesMode after operation is done
+
+- Changed
+moved most file operations from the ui module to the files module
+separate create_file / create_folder logic
+
+
+2025-08-06
+- Changed
+experimental rewrite of file tree
+- initial approach uses parentless entries with trails
+- tried using Weak, Rc, RefCell but gave up quickly because that was a bad idea
+- currently trying hashmap, but having issues with syncing file tree and
+visible entries
+
+
+2025-08-05
+- In Progress
+fs notifications
+
+- Changed
+rewrite file tree logic
+remove RefreshSelected message because it's not as easy to directly mutate child entries
+
+
 2025-08-04
 - Added
 last key press

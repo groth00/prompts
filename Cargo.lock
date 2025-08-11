@@ -3374,6 +3374,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "slotmap",
  "tokio",
  "trash",
  "zip",
