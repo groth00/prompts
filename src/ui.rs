@@ -49,7 +49,7 @@ use crate::{
         PromptKind, SqliteError, Template, delete_prompt, fetch_prompts, save_prompt,
         update_prompt, update_prompt_name,
     },
-    files4::{CreateEntryKind, EntryKind, FileTree, MAX_VISIBLE},
+    files::{CreateEntryKind, EntryKind, FileTree, MAX_VISIBLE},
     image_metadata::extract_image_metadata,
     nai::{self, ImageGenRequest, ImageGenerationError, ImageShape, Point, Position, Requester},
 };
