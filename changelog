@@ -1,3 +1,9 @@
+2025-08-11
+- Fixed
+corrected visible entries after batch delete, batch move, create
+can create a new entry when the selected entry is a file
+
+
 2025-08-07
 Known Issues
 operations in file pane may result in incorrect visible entries (underlying fs
