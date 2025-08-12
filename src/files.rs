@@ -41,13 +41,6 @@ impl Entry {
         self.visited = false;
         self.children.clear();
     }
-
-    fn clear_all(&mut self) {
-        self.visited = false;
-        self.expanded = false;
-
-        self.children.clear();
-    }
 }
 
 #[derive(Debug)]
@@ -593,8 +586,6 @@ impl FileTree {
 
                 if let Some((id, entry)) = maybe_entry {
                     if let Some(pid) = entry.parent {
-                        let expanded = self.entries[pid].expanded;
-
                         if id == self.root {
                             panic!("user deleted root of filetree outside of app");
                         }

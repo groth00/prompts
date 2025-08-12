@@ -1,6 +1,11 @@
+Known Issues
+file notifications are processed for create and remove events, but modifications (rename) are ignored due to lack of information
+
+
 2025-08-11
 - Added
 update file tree from external events via notify crate + iced subscription
+cancelall button for image queue
 
 - Changed
 file tree changed to slotmap implementation instead of parentless entries +
@@ -12,12 +17,6 @@ can create a new entry when the selected entry is a file
 
 
 2025-08-07
-Known Issues
-operations in file pane may result in incorrect visible entries (underlying fs
-operations are ok)
-- occasionally have to manually refresh, mostly on move_batch, delete_batch,
-delete
-
 - Added
 exit create/batch FilesMode after operation is done
 

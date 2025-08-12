@@ -380,7 +380,7 @@ impl Default for RequestParameters {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Character {
     pub prompt: String,
-    center: Point,
+    pub center: Point,
     enabled: bool,
 }
 
@@ -399,7 +399,7 @@ impl Character {
     }
 
     pub fn center(&mut self, pos: Position) -> &mut Self {
-        self.center = pos.as_point();
+        self.center = pos.into();
         self
     }
 
@@ -471,6 +471,38 @@ impl Default for Point {
     }
 }
 
+impl From<Position> for Point {
+    fn from(value: Position) -> Self {
+        match value {
+            Position::R0C0 => Point { x: 0.1, y: 0.1 },
+            Position::R0C1 => Point { x: 0.1, y: 0.3 },
+            Position::R0C2 => Point { x: 0.1, y: 0.5 },
+            Position::R0C3 => Point { x: 0.1, y: 0.7 },
+            Position::R0C4 => Point { x: 0.1, y: 0.9 },
+            Position::R1C0 => Point { x: 0.3, y: 0.1 },
+            Position::R1C1 => Point { x: 0.3, y: 0.3 },
+            Position::R1C2 => Point { x: 0.3, y: 0.5 },
+            Position::R1C3 => Point { x: 0.3, y: 0.7 },
+            Position::R1C4 => Point { x: 0.3, y: 0.9 },
+            Position::R2C0 => Point { x: 0.5, y: 0.1 },
+            Position::R2C1 => Point { x: 0.5, y: 0.3 },
+            Position::R2C2 => Point { x: 0.5, y: 0.5 },
+            Position::R2C3 => Point { x: 0.5, y: 0.7 },
+            Position::R2C4 => Point { x: 0.5, y: 0.9 },
+            Position::R3C0 => Point { x: 0.7, y: 0.1 },
+            Position::R3C1 => Point { x: 0.7, y: 0.3 },
+            Position::R3C2 => Point { x: 0.7, y: 0.5 },
+            Position::R3C3 => Point { x: 0.7, y: 0.7 },
+            Position::R3C4 => Point { x: 0.7, y: 0.9 },
+            Position::R4C0 => Point { x: 0.9, y: 0.1 },
+            Position::R4C1 => Point { x: 0.9, y: 0.3 },
+            Position::R4C2 => Point { x: 0.9, y: 0.5 },
+            Position::R4C3 => Point { x: 0.9, y: 0.7 },
+            Position::R4C4 => Point { x: 0.9, y: 0.9 },
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum Position {
@@ -501,34 +533,67 @@ pub enum Position {
     R4C4,
 }
 
-impl Position {
-    pub const fn as_point(&self) -> Point {
+impl From<Point> for Position {
+    fn from(value: Point) -> Self {
+        match value {
+            Point { x: 0.1, y: 0.1 } => Self::R0C0,
+            Point { x: 0.1, y: 0.3 } => Self::R0C1,
+            Point { x: 0.1, y: 0.5 } => Self::R0C2,
+            Point { x: 0.1, y: 0.7 } => Self::R0C3,
+            Point { x: 0.1, y: 0.9 } => Self::R0C4,
+            Point { x: 0.3, y: 0.1 } => Self::R1C0,
+            Point { x: 0.3, y: 0.3 } => Self::R1C1,
+            Point { x: 0.3, y: 0.5 } => Self::R1C2,
+            Point { x: 0.3, y: 0.7 } => Self::R1C3,
+            Point { x: 0.3, y: 0.9 } => Self::R1C4,
+            Point { x: 0.5, y: 0.1 } => Self::R2C0,
+            Point { x: 0.5, y: 0.3 } => Self::R2C1,
+            Point { x: 0.5, y: 0.5 } => Self::R2C2,
+            Point { x: 0.5, y: 0.7 } => Self::R2C3,
+            Point { x: 0.5, y: 0.9 } => Self::R2C4,
+            Point { x: 0.7, y: 0.1 } => Self::R3C0,
+            Point { x: 0.7, y: 0.3 } => Self::R3C1,
+            Point { x: 0.7, y: 0.5 } => Self::R3C2,
+            Point { x: 0.7, y: 0.7 } => Self::R3C3,
+            Point { x: 0.7, y: 0.9 } => Self::R3C4,
+            Point { x: 0.9, y: 0.1 } => Self::R4C0,
+            Point { x: 0.9, y: 0.3 } => Self::R4C1,
+            Point { x: 0.9, y: 0.5 } => Self::R4C2,
+            Point { x: 0.9, y: 0.7 } => Self::R4C3,
+            Point { x: 0.9, y: 0.9 } => Self::R4C4,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Display for Position {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::R0C0 => Point { x: 0.1, y: 0.1 },
-            Self::R0C1 => Point { x: 0.1, y: 0.3 },
-            Self::R0C2 => Point { x: 0.1, y: 0.5 },
-            Self::R0C3 => Point { x: 0.1, y: 0.7 },
-            Self::R0C4 => Point { x: 0.1, y: 0.9 },
-            Self::R1C0 => Point { x: 0.3, y: 0.1 },
-            Self::R1C1 => Point { x: 0.3, y: 0.3 },
-            Self::R1C2 => Point { x: 0.3, y: 0.5 },
-            Self::R1C3 => Point { x: 0.3, y: 0.7 },
-            Self::R1C4 => Point { x: 0.3, y: 0.9 },
-            Self::R2C0 => Point { x: 0.5, y: 0.1 },
-            Self::R2C1 => Point { x: 0.5, y: 0.3 },
-            Self::R2C2 => Point { x: 0.5, y: 0.5 },
-            Self::R2C3 => Point { x: 0.5, y: 0.7 },
-            Self::R2C4 => Point { x: 0.5, y: 0.9 },
-            Self::R3C0 => Point { x: 0.7, y: 0.1 },
-            Self::R3C1 => Point { x: 0.7, y: 0.3 },
-            Self::R3C2 => Point { x: 0.7, y: 0.5 },
-            Self::R3C3 => Point { x: 0.7, y: 0.7 },
-            Self::R3C4 => Point { x: 0.7, y: 0.9 },
-            Self::R4C0 => Point { x: 0.9, y: 0.1 },
-            Self::R4C1 => Point { x: 0.9, y: 0.3 },
-            Self::R4C2 => Point { x: 0.9, y: 0.5 },
-            Self::R4C3 => Point { x: 0.9, y: 0.7 },
-            Self::R4C4 => Point { x: 0.9, y: 0.9 },
+            Self::R0C0 => write!(f, "R0C0"),
+            Self::R0C1 => write!(f, "R0C1"),
+            Self::R0C2 => write!(f, "R0C2"),
+            Self::R0C3 => write!(f, "R0C3"),
+            Self::R0C4 => write!(f, "R0C4"),
+            Self::R1C0 => write!(f, "R1C0"),
+            Self::R1C1 => write!(f, "R1C1"),
+            Self::R1C2 => write!(f, "R1C2"),
+            Self::R1C3 => write!(f, "R1C3"),
+            Self::R1C4 => write!(f, "R1C4"),
+            Self::R2C0 => write!(f, "R2C0"),
+            Self::R2C1 => write!(f, "R2C1"),
+            Self::R2C2 => write!(f, "R2C2"),
+            Self::R2C3 => write!(f, "R2C3"),
+            Self::R2C4 => write!(f, "R2C4"),
+            Self::R3C0 => write!(f, "R3C0"),
+            Self::R3C1 => write!(f, "R3C1"),
+            Self::R3C2 => write!(f, "R3C2"),
+            Self::R3C3 => write!(f, "R3C3"),
+            Self::R3C4 => write!(f, "R3C4"),
+            Self::R4C0 => write!(f, "R4C0"),
+            Self::R4C1 => write!(f, "R4C1"),
+            Self::R4C2 => write!(f, "R4C2"),
+            Self::R4C3 => write!(f, "R4C3"),
+            Self::R4C4 => write!(f, "R4C4"),
         }
     }
 }

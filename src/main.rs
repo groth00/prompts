@@ -18,7 +18,7 @@ mod ui;
 use crate::{
     db::import_from_dir,
     ui::{
-        State, event_subscribe, run_channel_subscription, run_fsevent_subscription, update, view,
+        State, event_subscribe, run_fsevent_subscription, run_image_gen_subscription, update, view,
     },
 };
 
@@ -66,7 +66,7 @@ fn main() -> iced::Result {
                 .subscription(|state| {
                     Subscription::batch([
                         event_subscribe(state),
-                        run_channel_subscription(),
+                        run_image_gen_subscription(),
                         run_fsevent_subscription(),
                     ])
                 })

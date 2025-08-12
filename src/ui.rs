@@ -305,6 +305,7 @@ pub enum Message {
     Pause,
     Resume,
     Cancel(u64),
+    CancelAll,
     CreateImage((u64, ImageGenRequest)),
 
     // from channel
@@ -496,6 +497,19 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
                 return Task::perform(
                     async move {
                         let _ = tx.send(Message::Cancel(id)).await;
+                    },
+                    |_| Message::Dummy,
+                );
+            }
+        }
+        CancelAll => {
+            state.task_ids.drain(..);
+
+            if let ChannelReady::Ready(tx) = &mut state.task_state.ready {
+                let mut tx = tx.clone();
+                return Task::perform(
+                    async move {
+                        let _ = tx.send(Message::CancelAll).await;
                     },
                     |_| Message::Dummy,
                 );
@@ -1162,36 +1176,47 @@ fn view_prompts(state: &State) -> Element<Message> {
             button("*").on_press(Message::SetPosition(R0C2)),
             button("*").on_press(Message::SetPosition(R0C3)),
             button("*").on_press(Message::SetPosition(R0C4))
-        ],
+        ]
+        .spacing(4),
         row![
             button("*").on_press(Message::SetPosition(R1C0)),
             button("*").on_press(Message::SetPosition(R1C1)),
             button("*").on_press(Message::SetPosition(R1C2)),
             button("*").on_press(Message::SetPosition(R1C3)),
             button("*").on_press(Message::SetPosition(R1C4))
-        ],
+        ]
+        .spacing(4),
         row![
             button("*").on_press(Message::SetPosition(R2C0)),
             button("*").on_press(Message::SetPosition(R2C1)),
             button("*").on_press(Message::SetPosition(R2C2)),
             button("*").on_press(Message::SetPosition(R2C3)),
             button("*").on_press(Message::SetPosition(R2C4))
-        ],
+        ]
+        .spacing(4),
         row![
             button("*").on_press(Message::SetPosition(R3C0)),
             button("*").on_press(Message::SetPosition(R3C1)),
             button("*").on_press(Message::SetPosition(R3C2)),
             button("*").on_press(Message::SetPosition(R3C3)),
             button("*").on_press(Message::SetPosition(R3C4))
-        ],
+        ]
+        .spacing(4),
         row![
             button("*").on_press(Message::SetPosition(R4C0)),
             button("*").on_press(Message::SetPosition(R4C1)),
             button("*").on_press(Message::SetPosition(R4C2)),
             button("*").on_press(Message::SetPosition(R4C3)),
             button("*").on_press(Message::SetPosition(R4C4))
-        ],
-    ];
+        ]
+        .spacing(4),
+    ]
+    .spacing(4);
+
+    let curr_position: Position = state.character_prompts[state.curr_char].c.center.into();
+    let position_info = row![position_grid, text(curr_position.to_string())]
+        .align_y(Alignment::Center)
+        .spacing(8);
 
     let current_seed = text(state.current_seed.unwrap_or_default());
     let copy_seed = button(text("Use Previous Seed")).on_press(Message::CopySeed);
@@ -1210,10 +1235,23 @@ fn view_prompts(state: &State) -> Element<Message> {
         Message::ImageShape,
     );
 
-    let num_images = column![
-        text_input("1", &state.num_generate).on_input(Message::EditNumGenerate),
-        button("Generate").on_press(Message::Generate),
+    let num_images = row![
+        text_input("1", &state.num_generate)
+            .on_input(Message::EditNumGenerate)
+            .width(Length::Fixed(100f32)),
+        button("Generate").on_press(Message::Generate)
     ];
+
+    let generate_controls = row![
+        text(format!("Status: {}", state.task_state.status)),
+        button("Pause").on_press(Message::Pause),
+        button("Resume").on_press(Message::Resume),
+        button("Cancel All").on_press(Message::CancelAll),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
+
+    let all_controls = column![num_images, generate_controls].spacing(4);
 
     let mut ids = Column::with_capacity(state.task_ids.len());
     for i in &state.task_ids {
@@ -1224,24 +1262,16 @@ fn view_prompts(state: &State) -> Element<Message> {
     }
     let task_ids = scrollable(ids);
 
-    let generate_controls = column![
-        num_images,
-        text(format!("Status: {}", state.task_state.status)),
-        button("Pause").on_press(Message::Pause),
-        button("Resume").on_press(Message::Resume),
-        task_ids,
-    ]
-    .spacing(4);
-
     let mut content = Column::with_children([
         select_prompt.into(),
         rename.into(),
         crud_prompt.into(),
         text_areas.into(),
-        position_grid.into(),
+        position_info.into(),
         seed.into(),
         orientation.into(),
-        generate_controls.into(),
+        all_controls.into(),
+        task_ids.into(),
     ])
     .padding(2)
     .spacing(4);
@@ -1422,11 +1452,11 @@ pub fn event_subscribe(_state: &State) -> Subscription<Message> {
     event::listen().map(Message::Event)
 }
 
-pub fn run_channel_subscription() -> Subscription<Message> {
-    Subscription::run(channel_subscribe).map(Message::Channel)
+pub fn run_image_gen_subscription() -> Subscription<Message> {
+    Subscription::run(channel_image_gen).map(Message::Channel)
 }
 
-fn channel_subscribe() -> impl Stream<Item = ChannelEvent> {
+fn channel_image_gen() -> impl Stream<Item = ChannelEvent> {
     use iced::futures::{FutureExt, StreamExt, channel::mpsc, pin_mut, select};
     use tokio::time;
 
@@ -1460,6 +1490,12 @@ fn channel_subscribe() -> impl Stream<Item = ChannelEvent> {
                             if let Some(handle) = in_flight.shift_remove(&id) {
                                 handle.abort();
                                 let _ = output.send(ChannelEvent::Cancelled(id)).await;
+                            }
+                        }
+                        Message::CancelAll => {
+                            println!("rcv cancelall");
+                            for (_seed, handle) in in_flight.drain(..) {
+                                handle.abort();
                             }
                         }
                         Message::Pause => {
